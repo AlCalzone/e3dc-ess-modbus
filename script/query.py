@@ -54,7 +54,12 @@ def print_station(station: E3dcPowerStation) -> None:
     for number, inverter in station.inverter_slots.items():
         print()
         print_component(inverter, title=f"inverter_{number}")
-    for name in ("battery_limits", "grid_control", "battery_control"):
+    for name in (
+        "battery_limits",
+        "grid_control",
+        "battery_control",
+        "inverter_mode_control",
+    ):
         if (component := getattr(station, name)) is not None:
             print()
             print_component(component, title=name)

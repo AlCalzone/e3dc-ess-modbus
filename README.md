@@ -15,7 +15,7 @@ It needs Python 3.12 or later and [modbus-connection](https://github.com/home-as
 - **Protocol:** turn Modbus on under **Smart Functions** > **Smart Home** > **Modbus**, and set **Protocol** to **E3DC**. SunSpec mode is not supported.
 - **Connection:** Modbus TCP, port 502 by default. The port is set in the same menu.
 - **Unit ID:** 1.
-- **Firmware:** grid control needs release 2025_06 or later, battery control 2025_40, the inverter operating mode 2025_43, and battery limits and stored energy 2026_04.
+- **Firmware:** grid control needs release 2025_06 or later, battery control 2025_40, the inverter operating mode 2025_43, and battery limits, stored energy and the battery power percentage 2026_04.
 - **Supported devices:** E3/DC home power stations such as the S10 E, S10 E PRO, S10 X and S20 X PRO, and systems on the Q10 and P10 firmware lines.
 - **Network:** the power station answers only clients in its own subnet.
 
@@ -54,7 +54,8 @@ Every value is `None` until the first update. Each update returns an `UpdateRepo
 
 - **Request rate:** the device accepts at most 10 requests per second. The library spaces its requests by 100 ms to stay under that.
 - **Optional components:** the first update probes which components the firmware serves. Those it doesn't serve stay `None`.
-- **Setpoints expire:** a remote control setpoint lapses 30 seconds after it was last written. Write it again to hold it.
+- **Setpoints expire:** the feed-in limit and the battery power lapse 30 seconds after the last write. Write them again to hold them. The active power limit and the reactive power setpoints hold for the failsafe timeouts, 30 seconds by default. A timeout of 0 keeps them until the next write.
+- **Two-register writes:** the feed-in limit and the battery power go out as one FC16 write. A device that refuses FC16 gets two single-register writes, and the setpoint is briefly half-written between them.
 - **Feed-in limit:** `feed_in_limit` reads back the last value written. The limit in effect may differ.
 - **Wallbox bits:** which bits a wallbox uses depends on its model. Unused bits stay unset.
 - **Testing:** built against the vendor's Modbus TCP manual, version 2.80, and tested against modbus-connection's mock. It has not been tested on real hardware.
@@ -73,7 +74,7 @@ An E3/DC home power station. `timeout` asks the connection for a per-request tim
 - `serial_number`, `model`: from the identity block.
 - `readings_components`, `settings_components`: the components this firmware serves, once the first update has run.
 - `power_meter(number)`: meter slot 0 to 7, as a `PowerMeterReading`.
-- `identity`, `power`, `dc_string_list`, `wallboxes`, `power_meters`, `wide_power_meters`, `grid_control`, `battery_control`, `battery_limits`, `inverter_slots`: the components below.
+- `identity`, `power`, `dc_string_list`, `wallboxes`, `power_meters`, `wide_power_meters`, `grid_control`, `battery_control`, `inverter_mode_control`, `battery_limits`, `inverter_slots`: the components below.
 
 ### `identity` (`Identity`)
 
@@ -161,12 +162,17 @@ Optional. Present on firmware 2025_06 or later.
 
 Optional. Present on firmware 2025_40 or later.
 
-- `remote_control_disabled`: remote battery control is switched off.
+- `remote_control_disabled`: register 40199. Writing 1 ends remote battery control at once.
+- `await async_write_battery_power(watts)`: charge (positive) or discharge (negative) at a fixed power.
+- `await async_stop_remote_control()`: hand control back at once, by writing 1 to 40199.
+- `await async_write_remote_control_disabled(disabled)`: write 40199 directly, for example back to 0.
+
+### `inverter_mode_control` (`InverterModeControl`)
+
+Optional. Present on firmware 2025_43 or later.
+
 - `inverter_mode_request`: the forced inverter mode, an `InverterModeRequest`.
 - `inverter_mode`: the inverter mode in effect, an `InverterMode`.
-- `await async_write_battery_power(watts)`: charge (positive) or discharge (negative) at a fixed power.
-- `await async_write_battery_power_percent(percent)`: the same, in % of full power.
-- `await async_stop_remote_control()`: hand control back at once.
 - `await async_write_inverter_mode(mode)`: force an `InverterModeRequest`.
 
 ### `battery_limits` (`BatteryLimits`)
@@ -177,10 +183,13 @@ Optional. Present on firmware 2026_04 or later.
 - `max_discharge_power`: what the battery can give right now, negative, in W.
 - `remaining_energy`: stored energy, in Wh.
 - `full_charge_energy`: capacity when full, in Wh.
+- `await async_write_battery_power_percent(percent)`: charge (positive) or discharge (negative) at a share of full power.
 
 ### `inverter_slots` (`dict[int, Inverter]`)
 
-Inverter 0 is the device's own. Slots 1 to 7 hold the additional solar inverters that report a grid voltage.
+Every slot that answers its registers. Inverter 0 is the device's own. Slots 1 to 7 are for additional solar inverters, and an empty slot may answer with zeros.
+
+- `is_connected`: the inverter reports a grid voltage.
 
 - `active_power_l1` to `active_power_l3`: active power per phase, in W.
 - `apparent_power_l1` to `apparent_power_l3`: apparent power per phase, in VA.

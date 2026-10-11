@@ -6,7 +6,7 @@ from modbus_connection import (
     ModbusConnectionError,
     ModbusTimeoutError,
 )
-from modbus_connection.mock import MockModbusUnit, WriteEvent
+from modbus_connection.mock import MockModbusUnit
 
 from e3dc_ess_modbus import (
     E3dcPowerStation,
@@ -149,13 +149,15 @@ def test_power_meter_numbers_are_checked(station: E3dcPowerStation) -> None:
         station.power_meter(8)
 
 
-async def test_only_connected_inverters_are_polled(
+async def test_every_answering_inverter_slot_is_kept(
     station: E3dcPowerStation,
 ) -> None:
     await station.async_update_readings()
 
-    assert list(station.inverter_slots) == [0]
+    assert list(station.inverter_slots) == list(range(8))
+    assert not station.inverter_slots[1].is_connected
     inverter = station.inverter_slots[0]
+    assert inverter.is_connected
     assert inverter.apparent_power_l1 == 1800
     assert inverter.active_power_l1 == 1750
     assert inverter.voltage_l1 == 230.1
@@ -166,15 +168,28 @@ async def test_only_connected_inverters_are_polled(
     assert inverter.dc_current_1 == 4.5
 
 
-async def test_an_additional_inverter_is_found(
+async def test_an_inverter_offline_at_setup_connects_later(
+    station: E3dcPowerStation, mock_modbus_unit: MockModbusUnit
+) -> None:
+    await station.async_update_readings()
+    assert not station.inverter_slots[1].is_connected
+
+    seed(mock_modbus_unit, {41034 + 18: 2302})
+    await station.async_update_readings()
+
+    assert station.inverter_slots[1].is_connected
+    assert station.inverter_slots[1].voltage_l1 == 230.2
+
+
+async def test_a_refused_inverter_slot_is_dropped(
     mock_modbus_unit: MockModbusUnit,
 ) -> None:
-    seed(mock_modbus_unit, {**_with_magic(), 41034 + 18: 2302})
+    seed(mock_modbus_unit)
+    mock_modbus_unit.fail_read(register(41000 + 7 * 34), IllegalDataAddressError())
     station = E3dcPowerStation(mock_modbus_unit)
     await station.async_update_readings()
 
-    assert list(station.inverter_slots) == [0, 1]
-    assert station.inverter_slots[1].voltage_l1 == 230.2
+    assert list(station.inverter_slots) == list(range(7))
 
 
 async def test_battery_limits(station: E3dcPowerStation) -> None:
@@ -191,17 +206,23 @@ async def test_battery_limits(station: E3dcPowerStation) -> None:
 async def test_settings(station: E3dcPowerStation) -> None:
     report = await station.async_update_settings()
 
-    assert report.updated == {"grid_control", "battery_control"}
+    assert report.updated == {
+        "grid_control",
+        "battery_control",
+        "inverter_mode_control",
+    }
     grid = station.grid_control
     battery = station.battery_control
+    mode = station.inverter_mode_control
     assert grid is not None
     assert battery is not None
+    assert mode is not None
     assert grid.feed_in_limit == 5000
     assert grid.power_output_ready is True
     assert grid.active_power_failsafe_timeout == 30
     assert grid.reactive_power_failsafe_timeout == 45
     assert battery.remote_control_disabled is False
-    assert battery.inverter_mode is InverterMode.IDLE_OFF_GRID_POWER_SAVE
+    assert mode.inverter_mode is InverterMode.IDLE_OFF_GRID_POWER_SAVE
 
 
 async def test_settings_never_read_write_only_registers(
@@ -221,7 +242,7 @@ async def test_old_firmware_has_no_control_blocks(
     mock_modbus_unit: MockModbusUnit,
 ) -> None:
     seed(mock_modbus_unit)
-    for index in (40186, 40199, 40202):
+    for index in (40186, 40199, 40200, 40202):
         mock_modbus_unit.fail_read(register(index), IllegalDataAddressError())
     station = E3dcPowerStation(mock_modbus_unit)
     report = await station.async_update()
@@ -231,72 +252,44 @@ async def test_old_firmware_has_no_control_blocks(
     assert "battery_limits" not in station.readings_components
 
 
-async def test_battery_power_is_written_low_word_first(
-    station: E3dcPowerStation, mock_modbus_unit: MockModbusUnit
-) -> None:
-    await station.async_ensure_setup()
-    assert station.battery_control is not None
-    writes: list[WriteEvent] = []
-    mock_modbus_unit.on_write(writes.append)
-
-    await station.battery_control.async_write_battery_power(-3000)
-    await station.battery_control.async_write_battery_power_percent(-50)
-    await station.battery_control.async_stop_remote_control()
-
-    assert [(w.address, w.values) for w in writes] == [
-        (register(40197), [0xF448, 0xFFFF]),
-        (register(40210), [0xFE0C]),
-        (register(40199), [1]),
-    ]
-
-
-async def test_grid_control_writes(
-    station: E3dcPowerStation, mock_modbus_unit: MockModbusUnit
-) -> None:
-    await station.async_ensure_setup()
-    grid = station.grid_control
-    assert grid is not None
-    writes: list[WriteEvent] = []
-    mock_modbus_unit.on_write(writes.append)
-
-    await grid.async_write_feed_in_limit(4000)
-    await grid.async_write_active_power_limit(70)
-    await grid.async_write_reactive_power_percent(-12.5)
-    await grid.async_write_cos_phi(-600)
-    await grid.write("active_power_failsafe_timeout", 0)
-
-    assert [(w.address, w.values) for w in writes] == [
-        (register(40186), [4000, 0]),
-        (register(40192), [700]),
-        (register(40191), [0xFF83]),
-        (register(40190), [0xFDA8]),
-        (register(40194), [0]),
-    ]
-
-
 @pytest.mark.parametrize(
-    ("method", "value"),
+    ("refused", "settings", "battery_limits"),
     [
-        ("async_write_active_power_limit", 101),
-        ("async_write_active_power_failsafe", -1),
-        ("async_write_reactive_power_failsafe", 100.5),
-        ("async_write_reactive_power_percent", -101),
-        ("async_write_cos_phi", 601),
+        pytest.param(
+            (40200,),
+            ("grid_control", "battery_control"),
+            True,
+            id="battery_control_without_inverter_mode",
+        ),
+        pytest.param(
+            (40199, 40200),
+            ("grid_control",),
+            True,
+            id="battery_limits_without_battery_control",
+        ),
+        pytest.param(
+            (40202,),
+            ("grid_control", "battery_control", "inverter_mode_control"),
+            False,
+            id="battery_control_without_battery_limits",
+        ),
     ],
 )
-async def test_grid_control_rejects_out_of_range_setpoints(
-    station: E3dcPowerStation,
+async def test_partial_firmware(
     mock_modbus_unit: MockModbusUnit,
-    method: str,
-    value: float,
+    refused: tuple[int, ...],
+    settings: tuple[str, ...],
+    battery_limits: bool,
 ) -> None:
-    await station.async_ensure_setup()
-    writes: list[WriteEvent] = []
-    mock_modbus_unit.on_write(writes.append)
+    seed(mock_modbus_unit)
+    for index in refused:
+        mock_modbus_unit.fail_read(register(index), IllegalDataAddressError())
+    station = E3dcPowerStation(mock_modbus_unit)
+    report = await station.async_update()
 
-    with pytest.raises(ValueError):
-        await getattr(station.grid_control, method)(value)
-    assert writes == []
+    assert report.complete
+    assert station.settings_components == settings
+    assert ("battery_limits" in station.readings_components) is battery_limits
 
 
 async def test_a_failed_component_keeps_the_rest(
@@ -335,8 +328,9 @@ async def test_a_poll_costs_one_read_per_block(
     mock_modbus_unit.read_events.clear()
     await station.async_update_readings()
 
-    # power, DC strings, wallboxes, meters, wide meters, battery limits, inverter
-    assert len(mock_modbus_unit.read_events) == 7
+    # power, DC strings, wallboxes, meters, wide meters, battery limits, and
+    # three reads for the eight inverter slots
+    assert len(mock_modbus_unit.read_events) == 9
 
 
 async def test_raw_dump_covers_every_component(

@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Self
 
 from modbus_connection.model import ComponentGroup, Device, Raw, read_optional
 
-from .control import BatteryControl, BatteryLimits, GridControl
+from .control import BatteryControl, BatteryLimits, GridControl, InverterModeControl
 from .enums import PowerMeterType
 from .identity import Identity
 from .inverter import INVERTER_COUNT, INVERTER_STRIDE, Inverter
@@ -37,7 +37,7 @@ READINGS = (
     "battery_limits",
     "inverters",
 )
-SETTINGS = ("grid_control", "battery_control")
+SETTINGS = ("grid_control", "battery_control", "inverter_mode_control")
 
 
 class NotAnE3dcError(Exception):
@@ -92,6 +92,7 @@ class E3dcPowerStation(Device):
         self.wide_power_meters: WidePowerMeters | None = None
         self.grid_control: GridControl | None = None
         self.battery_control: BatteryControl | None = None
+        self.inverter_mode_control: InverterModeControl | None = None
         self.battery_limits: BatteryLimits | None = None
         self.inverter_slots: dict[int, Inverter] = {}
         self.inverters: ComponentGroup | None = None
@@ -105,9 +106,7 @@ class E3dcPowerStation(Device):
         Raises ``NotAnE3dcError`` when register 40001 lacks the magic value.
         """
         device = cls(unit, timeout=timeout)
-        await device.identity.async_update(notify=False)
-        if not device.identity.is_e3dc:
-            raise NotAnE3dcError(device.identity.magic)
+        await device._async_read_identity()
         return device
 
     @property
@@ -146,14 +145,15 @@ class E3dcPowerStation(Device):
     async def _async_setup(self) -> None:
         """Check the magic value and settle which optional blocks the firmware has."""
         if self.identity.magic is None:
-            await self.identity.async_update(notify=False)
-        if not self.identity.is_e3dc:
+            await self._async_read_identity()
+        elif not self.identity.is_e3dc:
             raise NotAnE3dcError(self.identity.magic)
 
         unit = self.modbus_unit
         self.wide_power_meters = await read_optional(WidePowerMeters(unit))
         self.grid_control = await read_optional(GridControl(unit))
         self.battery_control = await read_optional(BatteryControl(unit))
+        self.inverter_mode_control = await read_optional(InverterModeControl(unit))
         self.battery_limits = await read_optional(BatteryLimits(unit))
         await self._async_find_inverters()
         _LOGGER.debug(
@@ -165,16 +165,25 @@ class E3dcPowerStation(Device):
             ", ".join(self.settings_components) or "nothing",
         )
 
+    async def _async_read_identity(self) -> None:
+        """Read the identity block, or raise ``NotAnE3dcError`` for a foreign device."""
+        await self.identity.async_update(notify=False)
+        if not self.identity.is_e3dc:
+            raise NotAnE3dcError(self.identity.magic)
+
     async def _async_find_inverters(self) -> None:
-        """Keep the own inverter and each additional one that reports a grid voltage."""
+        """Keep every inverter slot that answers its block.
+
+        A slot without an inverter may answer with zeros. ``is_connected``
+        tells the two apart once the inverter reports a grid voltage.
+        """
         found: dict[int, Inverter] = {}
         for number in range(INVERTER_COUNT):
             inverter = Inverter(self.modbus_unit, base_offset=number * INVERTER_STRIDE)
             if await read_optional(inverter) is None:
                 _LOGGER.debug("Inverter %d refuses its block", number)
                 continue
-            if number == 0 or inverter.is_connected:
-                found[number] = inverter
+            found[number] = inverter
         self.inverter_slots = found
         self.inverters = (
             ComponentGroup(self.modbus_unit, list(found.values())) if found else None

@@ -21,8 +21,15 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          # Only a tag can be published, never a branch or a commit
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          persist-credentials: false
+      - name: Verify the checkout is the release tag
+        run: test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          # A cache restored from another run must not feed the release artifact
+          enable-cache: false
       - name: Set package version from release tag
         run: |
           VERSION="${RELEASE_TAG#v}"

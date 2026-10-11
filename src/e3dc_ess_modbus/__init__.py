@@ -1,6 +1,6 @@
 """Read and control E3/DC home power stations over Modbus TCP, as typed objects."""
 
-from .control import BatteryControl, BatteryLimits, GridControl
+from .control import BatteryControl, BatteryLimits, GridControl, InverterModeControl
 from .device import (
     READINGS,
     SETTINGS,
@@ -37,6 +37,7 @@ __all__ = [
     "Identity",
     "Inverter",
     "InverterMode",
+    "InverterModeControl",
     "InverterModeRequest",
     "NotAnE3dcError",
     "PowerFlows",
