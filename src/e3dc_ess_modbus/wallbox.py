@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+from typing import Any
+
 from modbus_connection.model import bit, repeating_group
 
 from .model import E3dcComponent, register
@@ -36,17 +39,27 @@ class Wallbox(E3dcComponent):
     one_phase = bit(register(40088), 12, writable=True)
     """Charge on one phase; unset charges on three."""
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Initialize the wallbox and the lock its bit writes share."""
+        super().__init__(*args, **kwargs)
+        self._write_lock = asyncio.Lock()
+
+    async def _async_write_bit(self, field: str, value: bool) -> None:
+        """Set one bit, one read-modify-write of the word at a time."""
+        async with self._write_lock:
+            await self.write(field, value)
+
     async def async_write_solar_mode(self, enabled: bool) -> None:
         """Charge from solar only, or in hybrid mode."""
-        await self.write("solar_mode", enabled)
+        await self._async_write_bit("solar_mode", enabled)
 
     async def async_write_charging(self, enabled: bool) -> None:
         """Allow charging, or abort it."""
-        await self.write("charging_aborted", not enabled)
+        await self._async_write_bit("charging_aborted", not enabled)
 
     async def async_write_one_phase(self, enabled: bool) -> None:
         """Charge on one phase, or on three."""
-        await self.write("one_phase", enabled)
+        await self._async_write_bit("one_phase", enabled)
 
 
 class Wallboxes(E3dcComponent):
@@ -55,7 +68,7 @@ class Wallboxes(E3dcComponent):
     slots = repeating_group(WALLBOX_COUNT, Wallbox, stride=1)
 
     @property
-    def available(self) -> list[tuple[int, Wallbox]]:
+    def configured(self) -> list[tuple[int, Wallbox]]:
         """Each configured wallbox with its slot number."""
         return [
             (number, slot) for number, slot in enumerate(self.slots) if slot.available

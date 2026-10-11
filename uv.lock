@@ -84,11 +84,12 @@ name = "e3dc-ess-modbus"
 version = "0.0.0"
 source = { editable = "." }
 dependencies = [
-    { name = "modbus-connection", extra = ["tmodbus"] },
+    { name = "modbus-connection" },
 ]
 
 [package.dev-dependencies]
 dev = [
+    { name = "modbus-connection", extra = ["tmodbus"] },
     { name = "mypy" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -96,10 +97,11 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "modbus-connection", extras = ["tmodbus"], specifier = ">=4.12.1" }]
+requires-dist = [{ name = "modbus-connection", specifier = ">=4.12.1,<5" }]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "modbus-connection", extras = ["tmodbus"] },
     { name = "mypy", specifier = ">=1.11" },
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-asyncio", specifier = ">=0.24" },

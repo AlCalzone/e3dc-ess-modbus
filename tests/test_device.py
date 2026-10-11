@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from modbus_connection import (
     IllegalDataAddressError,
@@ -9,14 +11,16 @@ from modbus_connection import (
 from modbus_connection.mock import MockModbusUnit
 
 from e3dc_ess_modbus import (
+    E3dcError,
     E3dcPowerStation,
     EmergencyPowerStatus,
     EmsStatus,
     InverterMode,
+    Inverters,
     NotAnE3dcError,
     PowerMeterType,
-    register,
 )
+from e3dc_ess_modbus.model import register
 
 from .conftest import FIRMWARE, MODEL, SERIAL, seed
 
@@ -81,7 +85,7 @@ async def test_power_flows(station: E3dcPowerStation) -> None:
 async def test_dc_strings(station: E3dcPowerStation) -> None:
     await station.async_update_readings()
 
-    first, second, third = station.dc_string_list
+    first, second, third = station.dc_strings
     assert (first.voltage, first.current, first.power) == (612, 4.5, 2754)
     assert (second.voltage, second.current, second.power) == (598, 4.3, 2571)
     assert (third.voltage, third.current, third.power) == (0, 0, 0)
@@ -90,7 +94,7 @@ async def test_dc_strings(station: E3dcPowerStation) -> None:
 async def test_wallboxes(station: E3dcPowerStation) -> None:
     await station.async_update_readings()
 
-    [(number, wallbox)] = station.wallboxes.available
+    [(number, wallbox)] = station.wallboxes.configured
     assert number == 0
     assert wallbox.solar_mode is True
     assert wallbox.charging_aborted is False
@@ -154,9 +158,9 @@ async def test_every_answering_inverter_slot_is_kept(
 ) -> None:
     await station.async_update_readings()
 
-    assert list(station.inverter_slots) == list(range(8))
-    assert not station.inverter_slots[1].is_connected
-    inverter = station.inverter_slots[0]
+    assert list(station.inverters or ()) == list(range(8))
+    assert not _inverters(station)[1].is_connected
+    inverter = _inverters(station)[0]
     assert inverter.is_connected
     assert inverter.apparent_power_l1 == 1800
     assert inverter.active_power_l1 == 1750
@@ -172,13 +176,13 @@ async def test_an_inverter_offline_at_setup_connects_later(
     station: E3dcPowerStation, mock_modbus_unit: MockModbusUnit
 ) -> None:
     await station.async_update_readings()
-    assert not station.inverter_slots[1].is_connected
+    assert not _inverters(station)[1].is_connected
 
     seed(mock_modbus_unit, {41034 + 18: 2302})
     await station.async_update_readings()
 
-    assert station.inverter_slots[1].is_connected
-    assert station.inverter_slots[1].voltage_l1 == 230.2
+    assert _inverters(station)[1].is_connected
+    assert _inverters(station)[1].voltage_l1 == 230.2
 
 
 async def test_a_refused_inverter_slot_is_dropped(
@@ -189,7 +193,7 @@ async def test_a_refused_inverter_slot_is_dropped(
     station = E3dcPowerStation(mock_modbus_unit)
     await station.async_update_readings()
 
-    assert list(station.inverter_slots) == list(range(7))
+    assert list(station.inverters or ()) == list(range(7))
 
 
 async def test_battery_limits(station: E3dcPowerStation) -> None:
@@ -345,3 +349,52 @@ async def test_raw_dump_covers_every_component(
 
 def _with_magic() -> dict[int, int | list[int]]:
     return {40001: 0xE3DC}
+
+
+def _inverters(station: E3dcPowerStation) -> Inverters:
+    assert station.inverters is not None
+    return station.inverters
+
+
+async def test_stale_32_bit_meter_values_lose(
+    station: E3dcPowerStation, mock_modbus_unit: MockModbusUnit
+) -> None:
+    await station.async_update_readings()
+    assert station.power_meter(0).power_l1 == -40000
+
+    mock_modbus_unit.fail_read(register(40137), IllegalDataAddressError())
+    await station.async_update_readings()
+
+    assert station.power_meter(0).power_l1 == -200
+
+
+async def test_concurrent_polls_set_up_once(
+    station: E3dcPowerStation, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+    setup = station._async_setup
+
+    async def counted() -> None:
+        nonlocal calls
+        calls += 1
+        # Let the other poll run while this setup is in progress
+        await asyncio.sleep(0)
+        await setup()
+
+    monkeypatch.setattr(station, "_async_setup", counted)
+    await asyncio.gather(
+        station.async_update_readings(), station.async_update_settings()
+    )
+
+    assert calls == 1
+
+
+async def test_detect_maps_a_refused_identity_to_not_an_e3dc(
+    mock_modbus_unit: MockModbusUnit,
+) -> None:
+    mock_modbus_unit.fail_read(register(40001), IllegalDataAddressError())
+    with pytest.raises(NotAnE3dcError) as err:
+        await E3dcPowerStation.async_detect(mock_modbus_unit)
+
+    assert err.value.magic is None
+    assert isinstance(err.value, E3dcError)

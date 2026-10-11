@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -7,7 +8,8 @@ import pytest
 from modbus_connection import IllegalFunctionError
 from modbus_connection.mock import MockModbusUnit, WriteEvent
 
-from e3dc_ess_modbus import E3dcPowerStation, InverterModeRequest, register
+from e3dc_ess_modbus import E3dcPowerStation, InverterModeRequest
+from e3dc_ess_modbus.model import register
 
 # A writer takes the set-up station and the value to write.
 Writer = Callable[[E3dcPowerStation, Any], Awaitable[None]]
@@ -100,6 +102,20 @@ ACCEPTED = [
         id="q_timeout_off",
     ),
     pytest.param(
+        _grid("async_write_active_power_failsafe_timeout"),
+        120,
+        40194,
+        [120],
+        id="p_timeout_typed",
+    ),
+    pytest.param(
+        _grid("async_write_reactive_power_failsafe_timeout"),
+        0,
+        40196,
+        [0],
+        id="q_timeout_typed",
+    ),
+    pytest.param(
         _battery("async_write_battery_power"), -3000, 40197, [0xF448, 0xFFFF], id="bat"
     ),
     pytest.param(
@@ -173,6 +189,9 @@ REJECTED = [
     pytest.param(
         _field("grid_control", "reactive_power_failsafe_timeout"), -1, id="q_timeout"
     ),
+    pytest.param(
+        _grid("async_write_active_power_failsafe_timeout"), 65536, id="p_timeout_typed"
+    ),
     pytest.param(_battery("async_write_battery_power"), 0x8000_0000, id="bat_wraps"),
     pytest.param(_battery("async_write_battery_power"), -0x8000_0001, id="bat_too_low"),
     pytest.param(_limits("async_write_battery_power_percent"), 100.1, id="bat_pct"),
@@ -217,3 +236,54 @@ async def test_wallbox_writes_set_the_bit_whatever_its_state(
     await wallbox.async_write_solar_mode(True)
 
     assert mock_modbus_unit.holding[register(40088)] == 0b0000000111011
+
+
+async def test_setpoints_remember_the_last_value_written(
+    station: E3dcPowerStation, writes: list[WriteEvent]
+) -> None:
+    grid, battery, limits = (
+        station.grid_control,
+        station.battery_control,
+        station.battery_limits,
+    )
+    assert grid is not None
+    assert battery is not None
+    assert limits is not None
+    assert battery.battery_power_setpoint is None
+
+    await battery.async_write_battery_power(-2000)
+    await grid.async_write_active_power_limit(70)
+    await limits.async_write_battery_power_percent(25)
+    with pytest.raises(ValueError):
+        await battery.async_write_battery_power(0x8000_0000)
+
+    assert battery.battery_power_setpoint == -2000
+    assert grid.active_power_limit_setpoint == 70
+    assert limits.battery_power_percent_setpoint == 25
+
+    await battery.async_stop_remote_control()
+    assert battery.battery_power_setpoint is None
+
+
+async def test_concurrent_wallbox_writes_keep_both_bits(
+    station: E3dcPowerStation,
+    mock_modbus_unit: MockModbusUnit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await station.async_update_readings()
+    wallbox = station.wallboxes.slots[0]
+    read = mock_modbus_unit.read_holding_registers
+
+    async def yielding_read(address: int, count: int) -> list[int]:
+        words = await read(address, count)
+        # Let the other write run between this read and its write
+        await asyncio.sleep(0)
+        return words
+
+    monkeypatch.setattr(mock_modbus_unit, "read_holding_registers", yielding_read)
+
+    await asyncio.gather(
+        wallbox.async_write_one_phase(True), wallbox.async_write_charging(False)
+    )
+
+    assert mock_modbus_unit.holding[register(40088)] == 0b1000000111111

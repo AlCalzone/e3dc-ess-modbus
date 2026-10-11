@@ -2,9 +2,10 @@
 
 from .control import BatteryControl, BatteryLimits, GridControl, InverterModeControl
 from .device import (
-    READINGS,
-    SETTINGS,
+    DcStrings,
+    E3dcError,
     E3dcPowerStation,
+    Inverters,
     NotAnE3dcError,
     PowerMeterReading,
 )
@@ -15,21 +16,19 @@ from .enums import (
     InverterModeRequest,
     PowerMeterType,
 )
-from .identity import MAGIC, Identity
+from .identity import Identity
 from .inverter import Inverter
 from .meters import PowerMeter, PowerMeterPhases, PowerMeters, WidePowerMeters
-from .model import E3dcComponent, UpdateReport, register
+from .model import UpdateReport
 from .power import DcString, PowerFlows
 from .wallbox import Wallbox, Wallboxes
 
 __all__ = [
-    "MAGIC",
-    "READINGS",
-    "SETTINGS",
     "BatteryControl",
     "BatteryLimits",
     "DcString",
-    "E3dcComponent",
+    "DcStrings",
+    "E3dcError",
     "E3dcPowerStation",
     "EmergencyPowerStatus",
     "EmsStatus",
@@ -39,6 +38,7 @@ __all__ = [
     "InverterMode",
     "InverterModeControl",
     "InverterModeRequest",
+    "Inverters",
     "NotAnE3dcError",
     "PowerFlows",
     "PowerMeter",
@@ -50,5 +50,4 @@ __all__ = [
     "Wallbox",
     "Wallboxes",
     "WidePowerMeters",
-    "register",
 ]

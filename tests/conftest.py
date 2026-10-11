@@ -5,7 +5,8 @@ from __future__ import annotations
 import pytest
 from modbus_connection.mock import MockModbusUnit
 
-from e3dc_ess_modbus import E3dcPowerStation, register
+from e3dc_ess_modbus import E3dcPowerStation
+from e3dc_ess_modbus.model import register
 
 
 def ascii_words(text: str, length: int) -> list[int]:

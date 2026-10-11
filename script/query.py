@@ -33,10 +33,10 @@ def print_station(station: E3dcPowerStation) -> None:
     print_component(station.identity, title="identity")
     print()
     print_component(station.power, title="power")
-    for number, string in enumerate(station.dc_string_list, start=1):
+    for number, string in enumerate(station.dc_strings, start=1):
         print()
         print_component(string, title=f"dc_string_{number}")
-    for number, wallbox in station.wallboxes.available:
+    for number, wallbox in station.wallboxes.configured:
         print()
         print_component(wallbox, title=f"wallbox_{number}")
     for number in range(len(station.power_meters.meters)):
@@ -51,7 +51,7 @@ def print_station(station: E3dcPowerStation) -> None:
             print(f"  power_{phase}    {getattr(meter, f'power_{phase}')} W")
     if station.wide_power_meters is not None:
         print(f"\nsg_ready_status  {station.wide_power_meters.sg_ready_status}")
-    for number, inverter in station.inverter_slots.items():
+    for number, inverter in (station.inverters or {}).items():
         print()
         print_component(inverter, title=f"inverter_{number}")
     for name in (

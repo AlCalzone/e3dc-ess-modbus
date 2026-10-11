@@ -8,21 +8,24 @@ version = "0.0.0"
 description = "Read and control E3/DC home power stations over Modbus TCP."
 readme = "README.md"
 requires-python = ">=3.12"
-license = { text = "Apache-2.0" }
-authors = [{ name = "e3dc-ess-modbus contributors" }]
+license = "Apache-2.0"
+authors = [{ name = "AlCalzone" }]
 keywords = ["modbus", "e3dc", "hagerenergy", "energy-storage", "battery", "solar"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Home Automation",
+    "Typing :: Typed",
 ]
-# The caller injects a ModbusUnit; tmodbus is the backend this is exercised against.
-dependencies = ["modbus-connection[tmodbus]>=4.12.1"]
+# The caller injects a ModbusUnit, so the library needs no backend of its own.
+dependencies = ["modbus-connection>=4.12.1,<5"]
 
 [project.urls]
 Homepage = "https://github.com/AlCalzone/e3dc-ess-modbus"
 
 [dependency-groups]
 dev = [
+    # The backend script/query.py connects through.
+    "modbus-connection[tmodbus]",
     "mypy>=1.11",
     "pytest>=8",
     "pytest-asyncio>=0.24",

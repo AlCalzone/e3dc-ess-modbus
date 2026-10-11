@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import Iterable
+from collections.abc import ItemsView, Iterable, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Self
 
+from modbus_connection import IllegalDataAddressError, IllegalFunctionError
 from modbus_connection.model import ComponentGroup, Device, Raw, read_optional
 
 from .control import BatteryControl, BatteryLimits, GridControl, InverterModeControl
@@ -40,8 +42,15 @@ READINGS = (
 SETTINGS = ("grid_control", "battery_control", "inverter_mode_control")
 
 
-class NotAnE3dcError(Exception):
-    """The device answered, but register 40001 does not hold the E3/DC magic."""
+class E3dcError(Exception):
+    """The base of the errors this library raises itself.
+
+    Transport and device errors arrive as modbus-connection's ``ModbusError``.
+    """
+
+
+class NotAnE3dcError(E3dcError):
+    """The device answered, but not as an E3/DC power station in E3DC mode."""
 
     def __init__(self, magic: int | None) -> None:
         """Initialize the error."""
@@ -69,6 +78,61 @@ class PowerMeterReading:
         return self.meter_type not in (None, PowerMeterType.NOT_USED)
 
 
+class DcStrings(ComponentGroup):
+    """The DC strings, read as one because their registers interleave.
+
+    Index 0 is string 1.
+    """
+
+    def __init__(self, unit: ModbusUnit) -> None:
+        """Set up the strings."""
+        self._strings = tuple(
+            DcString(unit, index=number) for number in range(1, DC_STRING_COUNT + 1)
+        )
+        super().__init__(unit, self._strings)
+
+    def __getitem__(self, index: int) -> DcString:
+        """DC string ``index + 1``."""
+        return self._strings[index]
+
+    def __iter__(self) -> Iterator[DcString]:
+        """Every DC string, string 1 first."""
+        return iter(self._strings)
+
+    def __len__(self) -> int:
+        """How many DC strings there are."""
+        return len(self._strings)
+
+
+class Inverters(ComponentGroup):
+    """The inverter slots that answer their registers, keyed by slot."""
+
+    def __init__(self, unit: ModbusUnit, slots: dict[int, Inverter]) -> None:
+        """Set up the group over the slots setup found."""
+        self._slots = slots
+        super().__init__(unit, slots.values())
+
+    def __getitem__(self, slot: int) -> Inverter:
+        """The inverter in ``slot``."""
+        return self._slots[slot]
+
+    def __contains__(self, slot: object) -> bool:
+        """Whether ``slot`` answered at setup."""
+        return slot in self._slots
+
+    def __iter__(self) -> Iterator[int]:
+        """The slots, in order."""
+        return iter(self._slots)
+
+    def __len__(self) -> int:
+        """How many slots answered at setup."""
+        return len(self._slots)
+
+    def items(self) -> ItemsView[int, Inverter]:
+        """``(slot, Inverter)`` for each slot."""
+        return self._slots.items()
+
+
 class E3dcPowerStation(Device):
     """An E3/DC home power station in Simple Mode, reached through a ``ModbusUnit``."""
 
@@ -80,11 +144,7 @@ class E3dcPowerStation(Device):
 
         self.identity = Identity(unit)
         self.power = PowerFlows(unit)
-        self.dc_string_list = [
-            DcString(unit, index=number) for number in range(1, DC_STRING_COUNT + 1)
-        ]
-        # The three strings' registers interleave, so they read as one.
-        self.dc_strings = ComponentGroup(unit, self.dc_string_list)
+        self.dc_strings = DcStrings(unit)
         self.wallboxes = Wallboxes(unit)
         self.power_meters = PowerMeters(unit)
 
@@ -94,8 +154,10 @@ class E3dcPowerStation(Device):
         self.battery_control: BatteryControl | None = None
         self.inverter_mode_control: InverterModeControl | None = None
         self.battery_limits: BatteryLimits | None = None
-        self.inverter_slots: dict[int, Inverter] = {}
-        self.inverters: ComponentGroup | None = None
+        self.inverters: Inverters | None = None
+
+        self._setup_lock = asyncio.Lock()
+        self._wide_meters_fresh = False
 
     @classmethod
     async def async_detect(
@@ -103,7 +165,7 @@ class E3dcPowerStation(Device):
     ) -> Self:
         """Read the identity block and build the device it describes.
 
-        Raises ``NotAnE3dcError`` when register 40001 lacks the magic value.
+        Raises ``NotAnE3dcError`` when the device is not in E3DC mode.
         """
         device = cls(unit, timeout=timeout)
         await device._async_read_identity()
@@ -130,17 +192,26 @@ class E3dcPowerStation(Device):
         return tuple(name for name in SETTINGS if getattr(self, name) is not None)
 
     def power_meter(self, number: int) -> PowerMeterReading:
-        """Meter slot ``number``, from 0 to 7."""
+        """Meter slot ``number``, from 0 to 7.
+
+        The 32-bit phase powers win only when they refreshed in the last poll
+        that read them.
+        """
         if not 0 <= number < POWER_METER_COUNT:
             raise ValueError(f"no power meter {number}")
         narrow = self.power_meters.meters[number]
         powers = (narrow.power_l1, narrow.power_l2, narrow.power_l3)
-        if self.wide_power_meters is not None:
+        if self.wide_power_meters is not None and self._wide_meters_fresh:
             wide = self.wide_power_meters.meters[number]
             wide_powers = (wide.power_l1, wide.power_l2, wide.power_l3)
             if None not in wide_powers:
                 powers = wide_powers
         return PowerMeterReading(number, narrow.meter_type, *powers)
+
+    async def async_ensure_setup(self) -> None:
+        """Run setup once, even when several polls start at the same time."""
+        async with self._setup_lock:
+            await super().async_ensure_setup()
 
     async def _async_setup(self) -> None:
         """Check the magic value and settle which optional blocks the firmware has."""
@@ -151,6 +222,7 @@ class E3dcPowerStation(Device):
 
         unit = self.modbus_unit
         self.wide_power_meters = await read_optional(WidePowerMeters(unit))
+        self._wide_meters_fresh = self.wide_power_meters is not None
         self.grid_control = await read_optional(GridControl(unit))
         self.battery_control = await read_optional(BatteryControl(unit))
         self.inverter_mode_control = await read_optional(InverterModeControl(unit))
@@ -167,7 +239,11 @@ class E3dcPowerStation(Device):
 
     async def _async_read_identity(self) -> None:
         """Read the identity block, or raise ``NotAnE3dcError`` for a foreign device."""
-        await self.identity.async_update(notify=False)
+        try:
+            await self.identity.async_update(notify=False)
+        except (IllegalDataAddressError, IllegalFunctionError) as err:
+            # A device in SunSpec mode refuses the identity block
+            raise NotAnE3dcError(None) from err
         if not self.identity.is_e3dc:
             raise NotAnE3dcError(self.identity.magic)
 
@@ -184,25 +260,27 @@ class E3dcPowerStation(Device):
                 _LOGGER.debug("Inverter %d refuses its block", number)
                 continue
             found[number] = inverter
-        self.inverter_slots = found
-        self.inverters = (
-            ComponentGroup(self.modbus_unit, list(found.values())) if found else None
-        )
+        self.inverters = Inverters(self.modbus_unit, found) if found else None
+
+    async def _async_poll(self, names: tuple[str, ...]) -> UpdateReport:
+        """Poll ``names`` and note whether the 32-bit meter values are current."""
+        await self.async_ensure_setup()
+        report = await self.async_poll(names)
+        if "wide_power_meters" in names:
+            self._wide_meters_fresh = "wide_power_meters" in report.updated
+        return report
 
     async def async_update_readings(self) -> UpdateReport:
         """Refresh what the device measures: power, battery, wallboxes, meters."""
-        await self.async_ensure_setup()
-        return await self.async_poll(READINGS)
+        return await self._async_poll(READINGS)
 
     async def async_update_settings(self) -> UpdateReport:
         """Refresh the remote control registers, which change only when written."""
-        await self.async_ensure_setup()
-        return await self.async_poll(SETTINGS)
+        return await self._async_poll(SETTINGS)
 
     async def async_update(self) -> UpdateReport:
         """Refresh readings and settings together in one report."""
-        await self.async_ensure_setup()
-        return await self.async_poll((*READINGS, *SETTINGS))
+        return await self._async_poll((*READINGS, *SETTINGS))
 
     async def async_read_raw(self, names: Iterable[str] | None = None) -> Raw:
         """Every register this device reads, undecoded, for diagnostics."""

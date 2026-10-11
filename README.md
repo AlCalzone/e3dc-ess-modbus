@@ -10,6 +10,8 @@ pip install e3dc-ess-modbus
 
 It needs Python 3.12 or later and [modbus-connection](https://github.com/home-assistant-libs/modbus-connection) 4.12.1 or later.
 
+The library brings no Modbus backend. The example below uses tmodbus, which `pip install "modbus-connection[tmodbus]"` installs.
+
 ## Device setup
 
 - **Protocol:** turn Modbus on under **Smart Functions** > **Smart Home** > **Modbus**, and set **Protocol** to **E3DC**. SunSpec mode is not supported.
@@ -54,7 +56,9 @@ Every value is `None` until the first update. Each update returns an `UpdateRepo
 
 - **Request rate:** the device accepts at most 10 requests per second. The library spaces its requests by 100 ms to stay under that.
 - **Optional components:** the first update probes which components the firmware serves. Those it doesn't serve stay `None`.
-- **Setpoints expire:** the feed-in limit and the battery power lapse 30 seconds after the last write. Write them again to hold them. The active power limit and the reactive power setpoints hold for the failsafe timeouts, 30 seconds by default. A timeout of 0 keeps them until the next write.
+- **Setpoints expire:** the feed-in limit and the battery power lapse 30 seconds after the last write. The active power limit and the reactive power setpoints hold for the failsafe timeouts, 30 seconds by default. A timeout of 0 keeps them until the next write.
+- **Holding a setpoint:** the library writes a setpoint once and never repeats it. To hold one, write it again before its timeout runs out. The `*_setpoint` attributes keep the last value written.
+- **Reading back a write:** a write doesn't refresh the cached values. Call `await async_update_settings()` to read back what took effect.
 - **Two-register writes:** the feed-in limit and the battery power go out as one FC16 write. A device that refuses FC16 gets two single-register writes, and the setpoint is briefly half-written between them.
 - **Feed-in limit:** `feed_in_limit` reads back the last value written. The limit in effect may differ.
 - **Wallbox bits:** which bits a wallbox uses depends on its model. Unused bits stay unset.
@@ -74,7 +78,7 @@ An E3/DC home power station. `timeout` asks the connection for a per-request tim
 - `serial_number`, `model`: from the identity block.
 - `readings_components`, `settings_components`: the components this firmware serves, once the first update has run.
 - `power_meter(number)`: meter slot 0 to 7, as a `PowerMeterReading`.
-- `identity`, `power`, `dc_string_list`, `wallboxes`, `power_meters`, `wide_power_meters`, `grid_control`, `battery_control`, `inverter_mode_control`, `battery_limits`, `inverter_slots`: the components below.
+- `identity`, `power`, `dc_strings`, `wallboxes`, `power_meters`, `wide_power_meters`, `grid_control`, `battery_control`, `inverter_mode_control`, `battery_limits`, `inverters`: the components below.
 
 ### `identity` (`Identity`)
 
@@ -99,9 +103,9 @@ An E3/DC home power station. `timeout` asks the connection for a per-request tim
 - `emergency_power_status`: an `EmergencyPowerStatus`.
 - `ems_status`: `EmsStatus` flags.
 
-### `dc_string_list` (`list[DcString]`)
+### `dc_strings` (`DcStrings`)
 
-DC strings 1 to 3. The manual marks string 3 as not used.
+A sequence of three `DcString`. Index 0 is string 1. The manual marks string 3 as not used.
 
 - `voltage`: string voltage, in V.
 - `current`: string current, in A.
@@ -110,7 +114,7 @@ DC strings 1 to 3. The manual marks string 3 as not used.
 ### `wallboxes` (`Wallboxes`)
 
 - `slots`: eight `Wallbox` objects, in the order the device's wallbox configuration sets.
-- `available`: `(slot number, Wallbox)` for each configured wallbox.
+- `configured`: `(slot number, Wallbox)` for each configured wallbox.
 
 Each `Wallbox` has:
 
@@ -150,6 +154,7 @@ Optional. Present on firmware 2025_06 or later.
 - `power_output_ready`: the inverter, DC-DC converter and battery can deliver power.
 - `active_power_failsafe_timeout`: how long an active power setpoint holds, in s.
 - `reactive_power_failsafe_timeout`: how long a reactive power setpoint holds, in s.
+- `active_power_limit_setpoint`: the last active power limit written, in %.
 - `await async_write_feed_in_limit(watts)`: cap the power fed into the grid.
 - `await async_write_active_power_limit(percent)`: cap the inverter's output, in % of rated power.
 - `await async_write_active_power_failsafe(percent)`: the active power limit after a setpoint expires.
@@ -157,12 +162,15 @@ Optional. Present on firmware 2025_06 or later.
 - `await async_write_reactive_power_percent(percent)`: set the reactive power, in % of rated apparent power.
 - `await async_write_cos_phi(value)`: set the reactive power as cos φ, from -600 to 600.
 - `await async_write_reactive_power_failsafe(percent)`: the reactive power after a setpoint expires.
+- `await async_write_active_power_failsafe_timeout(seconds)`: how long an active power setpoint holds. 0 turns the failsafe off.
+- `await async_write_reactive_power_failsafe_timeout(seconds)`: how long a reactive power setpoint holds. 0 turns the failsafe off.
 
 ### `battery_control` (`BatteryControl`)
 
 Optional. Present on firmware 2025_40 or later.
 
 - `remote_control_disabled`: register 40199. Writing 1 ends remote battery control at once.
+- `battery_power_setpoint`: the last battery power written, in W, or `None` after a stop.
 - `await async_write_battery_power(watts)`: charge (positive) or discharge (negative) at a fixed power.
 - `await async_stop_remote_control()`: hand control back at once, by writing 1 to 40199.
 - `await async_write_remote_control_disabled(disabled)`: write 40199 directly, for example back to 0.
@@ -183,14 +191,16 @@ Optional. Present on firmware 2026_04 or later.
 - `max_discharge_power`: what the battery can give right now, negative, in W.
 - `remaining_energy`: stored energy, in Wh.
 - `full_charge_energy`: capacity when full, in Wh.
+- `battery_power_percent_setpoint`: the last battery power percentage written.
 - `await async_write_battery_power_percent(percent)`: charge (positive) or discharge (negative) at a share of full power.
 
-### `inverter_slots` (`dict[int, Inverter]`)
+### `inverters` (`Inverters`)
 
-Every slot that answers its registers. Inverter 0 is the device's own. Slots 1 to 7 are for additional solar inverters, and an empty slot may answer with zeros.
+Optional. Present when any inverter slot answers.
+
+A mapping of slot number to `Inverter`, with every slot that answers its registers. Inverter 0 is the device's own. Slots 1 to 7 are for additional solar inverters, and an empty slot may answer with zeros.
 
 - `is_connected`: the inverter reports a grid voltage.
-
 - `active_power_l1` to `active_power_l3`: active power per phase, in W.
 - `apparent_power_l1` to `apparent_power_l3`: apparent power per phase, in VA.
 - `reactive_power_l1` to `reactive_power_l3`: reactive power per phase, in var.
@@ -211,10 +221,12 @@ Every slot that answers its registers. Inverter 0 is the device's own. Slots 1 t
 
 ### Errors
 
-- `NotAnE3dcError`: the device answered, but isn't an E3/DC power station in E3DC mode. Raised by `async_detect()` and the first update.
+- `E3dcError`: the base of the errors the library raises itself.
+- `NotAnE3dcError` (an `E3dcError`): the device refused the identity block, or didn't identify as an E3/DC power station in E3DC mode. Raised by `async_detect()` and the first update.
 - `ValueError`: a setpoint is out of range, or `power_meter()` got a slot outside 0 to 7. Nothing is written.
 - `ModbusConnectionError`: the connection was lost.
 - `ModbusTimeoutError`: the device didn't answer before any component had refreshed.
+- `ModbusExceptionError`: the device refused a write, for example a setpoint on firmware that doesn't support it.
 
 The register addresses are in the component modules under [`src/e3dc_ess_modbus`](src/e3dc_ess_modbus), and in the vendor's Modbus TCP manual on the [E3/DC customer portal](https://my.e3dc.com).
 

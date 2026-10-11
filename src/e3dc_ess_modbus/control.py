@@ -8,11 +8,14 @@ battery power lapse 30 seconds after the last write. The reactive power
 setpoints and the active power limit hold for the failsafe timeouts in 40194
 and 40196, which default to 30 seconds. A timeout of 0 turns the failsafe off,
 and the setpoint then holds until it is written again.
+
+The library writes a setpoint once. A caller that wants it to hold writes it
+again before its timeout runs out.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from modbus_connection import IllegalFunctionError
 from modbus_connection.encode import encode_int
@@ -99,6 +102,12 @@ class GridControl(E3dcComponent):
     )
     """How long a reactive power setpoint holds; 0 turns the failsafe off."""
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Initialize the component and the setpoints it remembers."""
+        super().__init__(*args, **kwargs)
+        self.active_power_limit_setpoint: float | None = None
+        """The last active power limit written, in %, or ``None``."""
+
     async def async_write_feed_in_limit(self, watts: int) -> None:
         """Cap the power fed into the grid; rewrite within 30 seconds to keep it."""
         await _write_int32(self._unit, 40186, _feed_in_limit(watts))
@@ -124,6 +133,15 @@ class GridControl(E3dcComponent):
     async def async_write_active_power_limit(self, percent: float) -> None:
         """Cap the inverter's active power, ignoring the house's consumption."""
         await _write_tenths(self._unit, 40192, percent, 0, 100)
+        self.active_power_limit_setpoint = percent
+
+    async def async_write_active_power_failsafe_timeout(self, seconds: int) -> None:
+        """Set how long an active power setpoint holds; 0 turns the failsafe off."""
+        await self.write("active_power_failsafe_timeout", seconds)
+
+    async def async_write_reactive_power_failsafe_timeout(self, seconds: int) -> None:
+        """Set how long a reactive power setpoint holds; 0 turns the failsafe off."""
+        await self.write("reactive_power_failsafe_timeout", seconds)
 
     async def async_write_active_power_failsafe(self, percent: float) -> None:
         """Set the active power limit that applies once a setpoint times out."""
@@ -142,6 +160,12 @@ class BatteryControl(E3dcComponent):
     remote_control_disabled = boolean(register(40199), writable=True)
     """1 disables remote battery control at once. The manual says 0 has no effect."""
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Initialize the component and the setpoint it remembers."""
+        super().__init__(*args, **kwargs)
+        self.battery_power_setpoint: int | None = None
+        """The last battery power written, in W, or ``None`` after a stop."""
+
     async def async_write_battery_power(self, watts: int) -> None:
         """Charge (positive) or discharge (negative) the battery at ``watts``.
 
@@ -149,10 +173,12 @@ class BatteryControl(E3dcComponent):
         returns to normal control unless this is rewritten within 30 seconds.
         """
         await _write_int32(self._unit, 40197, watts)
+        self.battery_power_setpoint = watts
 
     async def async_stop_remote_control(self) -> None:
         """End remote battery control at once, without waiting for its timeout."""
         await self.write("remote_control_disabled", True)
+        self.battery_power_setpoint = None
 
     async def async_write_remote_control_disabled(self, disabled: bool) -> None:
         """Write register 40199 directly, for example to clear it again."""
@@ -183,6 +209,12 @@ class BatteryLimits(E3dcComponent):
     remaining_energy = int32(register(40206), word_order="little", unit="Wh")
     full_charge_energy = int32(register(40208), word_order="little", unit="Wh")
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Initialize the component and the setpoint it remembers."""
+        super().__init__(*args, **kwargs)
+        self.battery_power_percent_setpoint: float | None = None
+        """The last battery power percentage written, or ``None``."""
+
     async def async_write_battery_power_percent(self, percent: float) -> None:
         """Charge (positive) or discharge (negative) at a share of full power.
 
@@ -190,3 +222,4 @@ class BatteryLimits(E3dcComponent):
         writes one signed 16-bit register.
         """
         await _write_tenths(self._unit, 40210, percent, -100, 100)
+        self.battery_power_percent_setpoint = percent
