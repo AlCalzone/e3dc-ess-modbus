@@ -11,7 +11,7 @@ from modbus_connection import (
     ModbusTimeoutError,
     ServerDeviceFailureError,
 )
-from modbus_connection.mock import MockModbusUnit
+from modbus_connection.mock import MockModbusConnection, MockModbusUnit
 
 from e3dc_ess_modbus import (
     E3dcError,
@@ -563,3 +563,16 @@ async def test_meter_listeners_see_this_polls_freshness(
     await station.async_update_readings()
 
     assert seen == [-40000, -40000]
+
+
+async def test_close_stops_listening_to_the_connection(
+    station: E3dcPowerStation, mock_modbus_connection: MockModbusConnection
+) -> None:
+    await station.async_ensure_setup()
+    assert station.battery_control is not None
+    await station.battery_control.async_write_battery_power(1000)
+    station.close()
+
+    mock_modbus_connection.simulate_connection_lost()
+
+    assert station.battery_control.battery_power_setpoint == 1000

@@ -101,7 +101,7 @@ class E3dcPowerStation(Device):
         self._setup_lock = asyncio.Lock()
         self._fresh_meter_blocks: set[str] = set()
         self._control_state = ControlState()
-        unit.on_connection_lost(self._forget_setpoints)
+        self._stop_watching_connection = unit.on_connection_lost(self._forget_setpoints)
         self._note_fresh_on_update(self.power_meters, "power_meters")
 
     @classmethod
@@ -116,6 +116,10 @@ class E3dcPowerStation(Device):
         await device._async_read_identity()
         await device.async_ensure_setup()
         return device
+
+    def close(self) -> None:
+        """Stop listening to the unit's connection, for a device no longer used."""
+        self._stop_watching_connection()
 
     @property
     def serial_number(self) -> str | None:
