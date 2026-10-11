@@ -32,12 +32,6 @@ asyncio.run(main())
 pip install e3dc-ess-modbus
 ```
 
-Until the first release is on PyPI, install from git:
-
-```bash
-pip install "e3dc-ess-modbus @ git+https://github.com/AlCalzone/e3dc-ess-modbus"
-```
-
 The library builds on [modbus-connection](https://github.com/home-assistant-libs/modbus-connection). You open the connection and hand the library a unit. The library never opens or closes the link itself.
 
 ## Requirements and gotchas
