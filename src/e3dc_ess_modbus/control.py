@@ -70,6 +70,8 @@ class ControlState:
     """The last battery power percentage acknowledged."""
     feed_in_limit: int | None = None
     """The last feed-in limit written or read, in W."""
+    feed_in_limit_unknown: bool = False
+    """A failed write may have left 40186 and 40187 holding a mixed value."""
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     """Held across each battery and feed-in write, so they reach the device in order."""
 
@@ -135,6 +137,7 @@ async def _write_int32(
     index: int,
     value: int,
     restore: Callable[[], Awaitable[None]],
+    forget: Callable[[], None],
 ) -> None:
     """Write a checked signed 32-bit value to register ``index`` and the next one.
 
@@ -145,7 +148,9 @@ async def _write_int32(
 
     A failure after the low word may have landed leaves the pair holding
     neither value. ``restore`` then runs, shielded from cancellation, before
-    this raises ``InconsistentWriteError``, or re-raises a cancellation.
+    this raises ``InconsistentWriteError``, or re-raises a cancellation. A
+    failed FC16 write that may have landed runs ``forget``, because the pair
+    then holds either the old or the new value.
     """
     low, high = encode_int(value, count=2, word_order="little")
     if not state.fc16_refused:
@@ -157,6 +162,11 @@ async def _write_int32(
                 "take two single-register writes"
             )
             state.fc16_refused = True
+        except ModbusExceptionError:
+            raise  # an exception response means nothing landed
+        except BaseException:
+            forget()
+            raise
         else:
             return
     try:
@@ -186,10 +196,21 @@ async def _async_restore_and_raise(
         index + 1,
         err,
     )
-    try:
-        await asyncio.shield(restore())
-    except Exception as restore_err:  # noqa: BLE001
+    # The restore runs as its own task and must finish before the caller's
+    # lock is released, even if this task is cancelled again while it waits
+    task = asyncio.ensure_future(restore())
+    cancelled: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as cancel:
+            cancelled = cancel
+        except Exception:  # noqa: BLE001, S110
+            pass  # retrieved from the task below
+    if not task.cancelled() and (restore_err := task.exception()) is not None:
         _LOGGER.warning("Restoring a safe state failed too: %r", restore_err)
+    if cancelled is not None:
+        raise cancelled
     if not isinstance(err, Exception):
         raise err
     raise InconsistentWriteError(
@@ -239,8 +260,12 @@ class GridControl(E3dcComponent):
         """The last reactive power failsafe acknowledged, in %."""
 
     def _note_feed_in_limit(self) -> None:
-        """Remember the feed-in limit read, which is the last one written."""
-        if self.feed_in_limit is not None:
+        """Remember the feed-in limit read, which is the last one written.
+
+        After a half-written pair with nothing to restore, the register holds a
+        mixed value, so reads count again only once a write has succeeded.
+        """
+        if self.feed_in_limit is not None and not self.state.feed_in_limit_unknown:
             self.state.feed_in_limit = self.feed_in_limit
 
     def clear_setpoints(self) -> None:
@@ -269,8 +294,12 @@ class GridControl(E3dcComponent):
         async with self.state.lock:
             previous = self.state.feed_in_limit
 
-            async def restore() -> None:
+            def forget() -> None:
                 self.state.feed_in_limit = None
+                self.state.feed_in_limit_unknown = True
+
+            async def restore() -> None:
+                forget()
                 if previous is None:
                     return
                 old_low, old_high = encode_int(previous, count=2, word_order="little")
@@ -283,9 +312,13 @@ class GridControl(E3dcComponent):
                     # alone can still bring the old limit back
                     await self._unit.write_register(register(FEED_IN_LIMIT), old_low)
                 self.state.feed_in_limit = previous
+                self.state.feed_in_limit_unknown = False
 
-            await _write_int32(self._unit, self.state, FEED_IN_LIMIT, checked, restore)
+            await _write_int32(
+                self._unit, self.state, FEED_IN_LIMIT, checked, restore, forget
+            )
             self.state.feed_in_limit = checked
+            self.state.feed_in_limit_unknown = False
 
     async def async_write_reactive_power(self, var: int) -> None:
         """Set the reactive power, in var.
@@ -400,7 +433,14 @@ class BatteryControl(E3dcComponent):
                 self.state.clear_battery()
                 await self._unit.write_register(register(REMOTE_CONTROL_DISABLED), 1)
 
-            await _write_int32(self._unit, self.state, BATTERY_POWER, checked, restore)
+            await _write_int32(
+                self._unit,
+                self.state,
+                BATTERY_POWER,
+                checked,
+                restore,
+                self.state.clear_battery,
+            )
             self.state.clear_battery()
             self.state.battery_power = checked
 

@@ -22,6 +22,8 @@ from e3dc_ess_modbus import (
 )
 from e3dc_ess_modbus.model import register
 
+from .conftest import seed
+
 # A writer takes the set-up station and the value to write.
 Writer = Callable[[E3dcPowerStation, Any], Awaitable[None]]
 
@@ -758,3 +760,97 @@ async def test_a_stuck_high_register_still_gets_the_old_low_word_back(
         await grid.async_write_feed_in_limit(3000)
 
     assert _pair(mock_modbus_unit, 40186) == 70000
+
+
+async def test_a_second_cancel_waits_for_the_restore(
+    station: E3dcPowerStation,
+    mock_modbus_unit: MockModbusUnit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await station.async_ensure_setup()
+    _refuse_fc16(monkeypatch, mock_modbus_unit)
+    battery = station.battery_control
+    assert battery is not None
+    write = mock_modbus_unit.write_register
+    restoring = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_restore(address: int, value: int) -> None:
+        if address == register(40198):
+            await write(address, value)
+            raise ModbusTimeoutError()
+        if address == register(40199):
+            restoring.set()
+            await release.wait()
+        await write(address, value)
+
+    monkeypatch.setattr(mock_modbus_unit, "write_register", slow_restore)
+    task = asyncio.create_task(battery.async_write_battery_power(-3000))
+    await restoring.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+
+    assert not task.done()
+    assert battery.state.lock.locked()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert mock_modbus_unit.holding[register(40199)] == 1
+    assert not battery.state.lock.locked()
+
+
+async def test_detect_remembers_the_feed_in_limit(
+    mock_modbus_unit: MockModbusUnit,
+) -> None:
+    seed(mock_modbus_unit)
+    station = await E3dcPowerStation.async_detect(mock_modbus_unit)
+
+    assert station.grid_control is not None
+    assert station.grid_control.state.feed_in_limit == 5000
+
+
+async def test_a_mixed_feed_in_limit_is_not_restored_later(
+    station: E3dcPowerStation,
+    mock_modbus_unit: MockModbusUnit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await station.async_ensure_setup()
+    grid = station.grid_control
+    assert grid is not None
+    grid.state.feed_in_limit = None
+    _refuse_fc16(monkeypatch, mock_modbus_unit)
+    mock_modbus_unit.fail_write(register(40187), ModbusTimeoutError())
+
+    with pytest.raises(InconsistentWriteError):
+        await grid.async_write_feed_in_limit(70000)
+    await station.async_update_settings()
+
+    assert grid.state.feed_in_limit is None
+
+    mock_modbus_unit.fail_write(register(40187), None)
+    await grid.async_write_feed_in_limit(3000)
+    await station.async_update_settings()
+    assert grid.state.feed_in_limit == 3000
+
+
+async def test_an_fc16_timeout_forgets_the_battery_setpoint(
+    station: E3dcPowerStation,
+    mock_modbus_unit: MockModbusUnit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await station.async_ensure_setup()
+    battery = station.battery_control
+    assert battery is not None
+    await battery.async_write_battery_power(-3000)
+
+    async def time_out(address: int, values: list[int]) -> None:
+        raise ModbusTimeoutError()
+
+    monkeypatch.setattr(mock_modbus_unit, "write_registers", time_out)
+    with pytest.raises(ModbusTimeoutError):
+        await battery.async_write_battery_power(3000)
+
+    assert battery.battery_power_setpoint is None

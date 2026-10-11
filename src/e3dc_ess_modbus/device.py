@@ -175,13 +175,17 @@ class E3dcPowerStation(Device):
             self._fresh_meter_blocks.add("wide_power_meters")
             self._note_fresh_on_update(self.wide_power_meters, "wide_power_meters")
         self.grid_status = await self._async_probe(GridStatus(unit))
-        self.grid_control = await self._async_probe(GridControl(unit))
-        self.battery_control = await self._async_probe(BatteryControl(unit))
+        # The control components share one state, which must be in place
+        # before the probe reads the feed-in limit into it
+        grid_control = GridControl(unit)
+        battery_control = BatteryControl(unit)
+        battery_limits = BatteryLimits(unit)
+        for component in (grid_control, battery_control, battery_limits):
+            component.state = self._control_state
+        self.grid_control = await self._async_probe(grid_control)
+        self.battery_control = await self._async_probe(battery_control)
         self.inverter_mode_control = await self._async_probe(InverterModeControl(unit))
-        self.battery_limits = await self._async_probe(BatteryLimits(unit))
-        for component in (self.grid_control, self.battery_control, self.battery_limits):
-            if component is not None:
-                component.state = self._control_state
+        self.battery_limits = await self._async_probe(battery_limits)
         await self._async_find_inverters()
         _LOGGER.debug(
             "Power station %s, model %s, firmware %s; readings: %s; settings: %s",
