@@ -97,7 +97,7 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "modbus-connection", specifier = ">=4.12.1,<5" }]
+requires-dist = [{ name = "modbus-connection", specifier = ">=4.12.4,<5" }]
 
 [package.metadata.requires-dev]
 dev = [

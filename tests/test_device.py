@@ -398,3 +398,11 @@ async def test_detect_maps_a_refused_identity_to_not_an_e3dc(
 
     assert err.value.magic is None
     assert isinstance(err.value, E3dcError)
+
+
+async def test_leaves_the_timeout_alone_without_one(
+    mock_modbus_unit: MockModbusUnit,
+) -> None:
+    E3dcPowerStation(mock_modbus_unit)
+
+    assert mock_modbus_unit.required_timeout is None

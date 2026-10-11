@@ -192,6 +192,9 @@ REJECTED = [
     pytest.param(
         _grid("async_write_active_power_failsafe_timeout"), 65536, id="p_timeout_typed"
     ),
+    pytest.param(
+        _battery("async_write_remote_control_disabled"), 2, id="disable_not_bool"
+    ),
     pytest.param(_battery("async_write_battery_power"), 0x8000_0000, id="bat_wraps"),
     pytest.param(_battery("async_write_battery_power"), -0x8000_0001, id="bat_too_low"),
     pytest.param(_limits("async_write_battery_power_percent"), 100.1, id="bat_pct"),

@@ -5,12 +5,10 @@ Read and control E3/DC home power stations over Modbus TCP.
 ## Installation
 
 ```bash
-pip install e3dc-ess-modbus
+pip install e3dc-ess-modbus "modbus-connection[tmodbus]"
 ```
 
-It needs Python 3.12 or later and [modbus-connection](https://github.com/home-assistant-libs/modbus-connection) 4.12.1 or later.
-
-The library brings no Modbus backend. The example below uses tmodbus, which `pip install "modbus-connection[tmodbus]"` installs.
+It needs Python 3.12 or later and [modbus-connection](https://github.com/home-assistant-libs/modbus-connection) 4.12.4 or later. The examples use its tmodbus backend, which `modbus-connection[tmodbus]` installs.
 
 ## Device setup
 
@@ -221,7 +219,8 @@ A mapping of slot number to `Inverter`, with every slot that answers its registe
 
 ### Errors
 
-- `E3dcError`: the base of the errors the library raises itself.
+All errors the library raises itself derive from `E3dcError`. Transport and device errors come from modbus-connection.
+
 - `NotAnE3dcError` (an `E3dcError`): the device refused the identity block, or didn't identify as an E3/DC power station in E3DC mode. Raised by `async_detect()` and the first update.
 - `ValueError`: a setpoint is out of range, or `power_meter()` got a slot outside 0 to 7. Nothing is written.
 - `ModbusConnectionError`: the connection was lost.

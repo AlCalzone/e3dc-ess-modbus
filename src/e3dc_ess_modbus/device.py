@@ -139,7 +139,8 @@ class E3dcPowerStation(Device):
     def __init__(self, unit: ModbusUnit, *, timeout: float | None = None) -> None:
         """Set up the sub-systems."""
         super().__init__(unit)
-        unit.require_timeout(timeout)
+        if timeout is not None:
+            unit.require_timeout(timeout)
         unit.set_message_spacing(MESSAGE_SPACING)
 
         self.identity = Identity(unit)

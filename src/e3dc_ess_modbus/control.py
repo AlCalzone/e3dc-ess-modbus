@@ -37,6 +37,12 @@ def _timeout(value: int) -> int:
     return value
 
 
+def _flag(value: bool) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{value!r} is not a bool")
+    return value
+
+
 def _feed_in_limit(watts: int) -> int:
     if not 0 <= watts <= INT32_MAX:
         raise ValueError(f"feed-in limit {watts} W is outside 0-{INT32_MAX}")
@@ -157,7 +163,7 @@ class BatteryControl(E3dcComponent):
 
     register_ranges = ((register(40199), register(40199)),)
 
-    remote_control_disabled = boolean(register(40199), writable=True)
+    remote_control_disabled = boolean(register(40199), writable=_flag)
     """1 disables remote battery control at once. The manual says 0 has no effect."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
