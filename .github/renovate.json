@@ -1,0 +1,47 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Renovate configuration for e3dc-ess-modbus",
+  "dependencyDashboard": false,
+  "extends": [
+    "config:recommended",
+    ":separateMajorReleases",
+    ":combinePatchMinorReleases",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "rebaseWhen": "conflicted",
+  "ignorePaths": [
+    "**/node_modules/**"
+  ],
+  "github-actions": {
+    "enabled": true
+  },
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": [
+      "before 5am on monday"
+    ]
+  },
+  "packageRules": [
+    {
+      "matchManagers": [
+        "github-actions"
+      ],
+      "groupName": "GitHub Actions",
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "matchDepTypes": [
+        "dev",
+        "test"
+      ],
+      "groupName": "Dev & Test Dependencies",
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "matchPackageNames": [
+        "modbus-connection"
+      ],
+      "groupName": "Core Protocol Dependencies"
+    }
+  ]
+}
