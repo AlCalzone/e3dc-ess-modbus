@@ -154,7 +154,8 @@ async def test_only_connected_inverters_are_polled(
 ) -> None:
     await station.async_update_readings()
 
-    [inverter] = station.inverter_list
+    assert list(station.inverter_slots) == [0]
+    inverter = station.inverter_slots[0]
     assert inverter.apparent_power_l1 == 1800
     assert inverter.active_power_l1 == 1750
     assert inverter.voltage_l1 == 230.1
@@ -172,8 +173,8 @@ async def test_an_additional_inverter_is_found(
     station = E3dcPowerStation(mock_modbus_unit)
     await station.async_update_readings()
 
-    assert len(station.inverter_list) == 2
-    assert station.inverter_list[1].voltage_l1 == 230.2
+    assert list(station.inverter_slots) == [0, 1]
+    assert station.inverter_slots[1].voltage_l1 == 230.2
 
 
 async def test_battery_limits(station: E3dcPowerStation) -> None:

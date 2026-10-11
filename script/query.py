@@ -51,7 +51,7 @@ def print_station(station: E3dcPowerStation) -> None:
             print(f"  power_{phase}    {getattr(meter, f'power_{phase}')} W")
     if station.wide_power_meters is not None:
         print(f"\nsg_ready_status  {station.wide_power_meters.sg_ready_status}")
-    for number, inverter in enumerate(station.inverter_list):
+    for number, inverter in station.inverter_slots.items():
         print()
         print_component(inverter, title=f"inverter_{number}")
     for name in ("battery_limits", "grid_control", "battery_control"):

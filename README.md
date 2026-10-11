@@ -87,7 +87,7 @@ convention applies to the inverter block, which the manual lists at 41000.
 The device sends 32-bit values low word first, the "int32 swap" layout:
 
 ```python
-station.power.grid_power     # -600: feeding 600 W into the grid
+station.power.grid_power  # -600: feeding 600 W into the grid
 station.power.battery_power  # -1200: discharging at 1.2 kW
 ```
 
@@ -124,7 +124,7 @@ once setup has settled it.
 Register 40082 packs two percentages into one word. The library splits it:
 
 ```python
-station.power.autarky           # 26, the high byte
+station.power.autarky  # 26, the high byte
 station.power.self_consumption  # 82, the low byte
 ```
 
@@ -162,10 +162,10 @@ if meter.is_installed:
 
 The device's own inverter is inverter 0. Additional solar inverters take slots
 1 to 7. Setup keeps inverter 0 and each additional inverter that reports a grid
-voltage, so `inverter_list` holds only what is connected:
+voltage, so `inverter_slots` holds only what is connected, keyed by slot:
 
 ```python
-for number, inverter in enumerate(station.inverter_list):
+for number, inverter in station.inverter_slots.items():
     print(number, inverter.active_power_l1, inverter.frequency)
 ```
 
@@ -177,13 +177,13 @@ it before the timeout runs out:
 
 ```python
 battery = station.battery_control
-await battery.async_write_battery_power(3000)    # charge at 3 kW
-await battery.async_write_battery_power(-2000)   # discharge at 2 kW
-await battery.async_stop_remote_control()        # back to normal, at once
+await battery.async_write_battery_power(3000)  # charge at 3 kW
+await battery.async_write_battery_power(-2000)  # discharge at 2 kW
+await battery.async_stop_remote_control()  # back to normal, at once
 
 grid = station.grid_control
-await grid.async_write_feed_in_limit(4000)       # watts
-await grid.async_write_active_power_limit(70)    # percent of rated power
+await grid.async_write_feed_in_limit(4000)  # watts
+await grid.async_write_active_power_limit(70)  # percent of rated power
 await grid.write("active_power_failsafe_timeout", 60)
 ```
 

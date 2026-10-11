@@ -93,7 +93,7 @@ class E3dcPowerStation(Device):
         self.grid_control: GridControl | None = None
         self.battery_control: BatteryControl | None = None
         self.battery_limits: BatteryLimits | None = None
-        self.inverter_list: list[Inverter] = []
+        self.inverter_slots: dict[int, Inverter] = {}
         self.inverters: ComponentGroup | None = None
 
     @classmethod
@@ -167,16 +167,18 @@ class E3dcPowerStation(Device):
 
     async def _async_find_inverters(self) -> None:
         """Keep the own inverter and each additional one that reports a grid voltage."""
-        found: list[Inverter] = []
+        found: dict[int, Inverter] = {}
         for number in range(INVERTER_COUNT):
             inverter = Inverter(self.modbus_unit, base_offset=number * INVERTER_STRIDE)
             if await read_optional(inverter) is None:
                 _LOGGER.debug("Inverter %d refuses its block", number)
                 continue
             if number == 0 or inverter.is_connected:
-                found.append(inverter)
-        self.inverter_list = found
-        self.inverters = ComponentGroup(self.modbus_unit, found) if found else None
+                found[number] = inverter
+        self.inverter_slots = found
+        self.inverters = (
+            ComponentGroup(self.modbus_unit, list(found.values())) if found else None
+        )
 
     async def async_update_readings(self) -> UpdateReport:
         """Refresh what the device measures: power, battery, wallboxes, meters."""
