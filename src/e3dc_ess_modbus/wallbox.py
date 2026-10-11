@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from modbus_connection import ModbusError
 from modbus_connection.model import bit, repeating_group
 
 from .model import E3dcComponent, register
@@ -24,7 +25,9 @@ class Wallbox(E3dcComponent):
     solar_mode = bit(register(40088), 1, writable=True)
     """Charge from solar only; unset charges in hybrid mode."""
     charging_aborted = bit(register(40088), 2, writable=True)
+    """Charging is not allowed. This is the bit the charging switch writes."""
     charging = bit(register(40088), 3)
+    """A vehicle is drawing power. The wallbox sets this bit itself."""
     type2_locked = bit(register(40088), 4)
     type2_plugged = bit(register(40088), 5)
     """Multi connect and efy wallboxes set this only with a vehicle attached."""
@@ -44,18 +47,37 @@ class Wallbox(E3dcComponent):
         super().__init__(*args, **kwargs)
         self._write_lock = asyncio.Lock()
 
+    @property
+    def slot(self) -> int:
+        """The wallbox slot, from 0 to 7, that this control word belongs to."""
+        return self._instance_offset
+
+    @property
+    def charging_allowed(self) -> bool | None:
+        """Charging is allowed, the inverse of ``charging_aborted``."""
+        aborted = self.charging_aborted
+        return None if aborted is None else not aborted
+
     async def _async_write_bit(self, field: str, value: bool) -> None:
         """Set one bit, one read-modify-write of the word at a time."""
         async with self._write_lock:
-            await self.write(field, value)
+            try:
+                await self.write(field, value)
+            except ModbusError as err:
+                err.add_note(f"writing {field} of wallbox {self.slot}")
+                raise
 
     async def async_write_solar_mode(self, enabled: bool) -> None:
         """Charge from solar only, or in hybrid mode."""
         await self._async_write_bit("solar_mode", enabled)
 
-    async def async_write_charging(self, enabled: bool) -> None:
-        """Allow charging, or abort it."""
-        await self._async_write_bit("charging_aborted", not enabled)
+    async def async_write_charging_allowed(self, allowed: bool) -> None:
+        """Allow charging, or abort it, through ``charging_aborted``."""
+        await self._async_write_bit("charging_aborted", not allowed)
+
+    async def async_write_schuko_on(self, on: bool) -> None:
+        """Switch the type F socket on or off."""
+        await self._async_write_bit("schuko_on", on)
 
     async def async_write_one_phase(self, enabled: bool) -> None:
         """Charge on one phase, or on three."""
@@ -68,8 +90,10 @@ class Wallboxes(E3dcComponent):
     slots = repeating_group(WALLBOX_COUNT, Wallbox, stride=1)
 
     @property
-    def configured(self) -> list[tuple[int, Wallbox]]:
-        """Each configured wallbox with its slot number."""
-        return [
-            (number, slot) for number, slot in enumerate(self.slots) if slot.available
-        ]
+    def configured(self) -> dict[int, Wallbox]:
+        """The configured wallboxes, keyed by slot."""
+        return {
+            number: wallbox
+            for number, wallbox in enumerate(self.slots)
+            if wallbox.available
+        }

@@ -10,95 +10,161 @@ and 40196, which default to 30 seconds. A timeout of 0 turns the failsafe off,
 and the setpoint then holds until it is written again.
 
 The library writes a setpoint once. A caller that wants it to hold writes it
-again before its timeout runs out.
+again before its timeout runs out. A ``*_setpoint`` attribute holds the last
+value the device acknowledged. It is not cleared when the setpoint lapses.
 """
 
 from __future__ import annotations
 
+import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from modbus_connection import IllegalFunctionError
+from modbus_connection import IllegalFunctionError, ModbusError
 from modbus_connection.encode import encode_int
 from modbus_connection.model import boolean, enum, int32, integer
 
 from .enums import InverterMode, InverterModeRequest
+from .errors import InconsistentWriteError, InvalidValueError
 from .model import E3dcComponent, register
 
 if TYPE_CHECKING:
     from modbus_connection import ModbusUnit
 
+_LOGGER = logging.getLogger(__name__)
+
 INT16_MIN, INT16_MAX = -0x8000, 0x7FFF
 INT32_MIN, INT32_MAX = -0x8000_0000, 0x7FFF_FFFF
+COS_PHI_MIN, COS_PHI_MAX = -600, 600
+PERCENT_MIN, PERCENT_MAX = -100, 100
+
+# The manual's numbers of the setpoint registers
+FEED_IN_LIMIT = 40186
+REACTIVE_POWER = 40189
+COS_PHI = 40190
+REACTIVE_POWER_PERCENT = 40191
+ACTIVE_POWER_LIMIT = 40192
+ACTIVE_POWER_FAILSAFE = 40193
+REACTIVE_POWER_FAILSAFE = 40195
+BATTERY_POWER = 40197
+BATTERY_POWER_PERCENT = 40210
 
 
-def _timeout(value: int) -> int:
-    if not 0 <= value <= 0xFFFF:
-        raise ValueError(f"timeout {value} s is outside 0-65535")
+@dataclass
+class ControlState:
+    """What the control components of one power station share."""
+
+    fc16_refused: bool = False
+    """The device refused an FC16 write, so int32 setpoints take two FC06 writes."""
+    battery_power: int | None = None
+    """The last battery power acknowledged, in W."""
+    battery_power_percent: float | None = None
+    """The last battery power percentage acknowledged."""
+
+    def clear_battery(self) -> None:
+        """Forget the battery setpoint, after a stop or a failed write."""
+        self.battery_power = None
+        self.battery_power_percent = None
+
+
+def _int(value: Any, low: int, high: int, what: str) -> int:
+    """Check that ``value`` is an int from ``low`` to ``high``."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InvalidValueError(f"{what} {value!r} is not an int")
+    if not low <= value <= high:
+        raise InvalidValueError(f"{what} {value} is outside {low} to {high}")
     return value
 
 
-def _flag(value: bool) -> bool:
+def _percent(value: Any, low: float, high: float) -> float:
+    """Check that ``value`` is a number from ``low`` to ``high``."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise InvalidValueError(f"{value!r} is not a number")
+    if not low <= value <= high:
+        raise InvalidValueError(f"{value} % is outside {low} to {high}")
+    return value
+
+
+def _timeout(value: Any) -> int:
+    return _int(value, 0, 0xFFFF, "timeout")
+
+
+def _flag(value: Any) -> bool:
     if not isinstance(value, bool):
-        raise ValueError(f"{value!r} is not a bool")
+        raise InvalidValueError(f"{value!r} is not a bool")
     return value
 
 
-def _feed_in_limit(watts: int) -> int:
-    if not 0 <= watts <= INT32_MAX:
-        raise ValueError(f"feed-in limit {watts} W is outside 0-{INT32_MAX}")
-    return watts
+def _mode_request(value: Any) -> InverterModeRequest:
+    if not isinstance(value, InverterModeRequest):
+        raise InvalidValueError(f"{value!r} is not an InverterModeRequest")
+    return value
 
 
-def _int16(value: int) -> int:
-    """A signed 16-bit value as the register word that carries it."""
-    if not INT16_MIN <= value <= INT16_MAX:
-        raise ValueError(f"{value} does not fit a signed 16-bit register")
+def _word(value: int) -> int:
+    """A checked signed 16-bit value as the register word that carries it."""
     return encode_int(value, count=1)[0]
 
 
 async def _write_tenths(
-    unit: ModbusUnit, index: int, percent: float, low: float, high: float
-) -> None:
+    unit: ModbusUnit, index: int, percent: Any, low: float, high: float
+) -> float:
     """Write a percentage to register ``index`` in the device's 0.1 % steps."""
-    if not low <= percent <= high:
-        raise ValueError(f"{percent} % is outside {low}-{high}")
-    await unit.write_register(register(index), _int16(round(percent * 10)))
+    checked = _percent(percent, low, high)
+    await unit.write_register(register(index), _word(round(checked * 10)))
+    return checked
 
 
-async def _write_int32(unit: ModbusUnit, index: int, value: int) -> None:
-    """Write a signed 32-bit value to register ``index`` and the one after it.
+async def _write_int32(
+    unit: ModbusUnit, state: ControlState, index: int, value: int
+) -> None:
+    """Write a checked signed 32-bit value to register ``index`` and the next one.
 
     The manual lists no FC16 for this device, but one FC16 write is the only
     way to change both words at once. A device that refuses FC16 gets two FC06
-    writes, low word first. Between the two writes, the register pair holds the
-    new low word next to the old high word.
+    writes, low word first, for the rest of the session.
     """
-    if not INT32_MIN <= value <= INT32_MAX:
-        raise ValueError(f"{value} does not fit a signed 32-bit register pair")
     low, high = encode_int(value, count=2, word_order="little")
+    if not state.fc16_refused:
+        try:
+            await unit.write_registers(register(index), [low, high])
+        except IllegalFunctionError:
+            _LOGGER.warning(
+                "The power station refuses FC16, so two-register setpoints now "
+                "take two single-register writes"
+            )
+            state.fc16_refused = True
+        else:
+            return
+    await unit.write_register(register(index), low)
     try:
-        await unit.write_registers(register(index), [low, high])
-    except IllegalFunctionError:
-        await unit.write_register(register(index), low)
         await unit.write_register(register(index + 1), high)
+    except ModbusError as err:
+        _LOGGER.warning(
+            "Register %d took its new low word, but register %d refused its high "
+            "word: the pair holds neither the old nor the new value",
+            index,
+            index + 1,
+        )
+        raise InconsistentWriteError(
+            f"registers {index} and {index + 1} hold half of {value}"
+        ) from err
 
 
 class GridControl(E3dcComponent):
-    """Feed-in limitation and active and reactive power control.
+    """Feed-in limitation and active and reactive power control, from 2025_06.
 
     The device takes these only when it is certified for grid operator control.
     """
 
     register_ranges = (
-        (register(40186), register(40188)),
+        (register(40186), register(40187)),
         (register(40194), register(40194)),
         (register(40196), register(40196)),
     )
 
     feed_in_limit = int32(register(40186), word_order="little", unit="W")
     """The last limit written, not the limit in effect."""
-    power_output_ready = boolean(register(40188))
-    """PV inverter on the grid, DC-DC converter working, battery dischargeable."""
     active_power_failsafe_timeout = integer(
         register(40194), signed=False, unit="s", writable=_timeout
     )
@@ -111,12 +177,32 @@ class GridControl(E3dcComponent):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         """Initialize the component and the setpoints it remembers."""
         super().__init__(*args, **kwargs)
+        self.state = ControlState()
+        self.reactive_power_setpoint: int | None = None
+        """The last reactive power acknowledged, in var."""
+        self.cos_phi_setpoint: int | None = None
+        """The last cos φ setpoint acknowledged, from -600 to 600."""
+        self.reactive_power_percent_setpoint: float | None = None
+        """The last reactive power acknowledged, in % of rated apparent power."""
         self.active_power_limit_setpoint: float | None = None
-        """The last active power limit written, in %, or ``None``."""
+        """The last active power limit acknowledged, in %."""
+        self.active_power_failsafe_setpoint: float | None = None
+        """The last active power failsafe acknowledged, in %."""
+        self.reactive_power_failsafe_setpoint: float | None = None
+        """The last reactive power failsafe acknowledged, in %."""
+
+    def _set_reactive(
+        self, var: int | None, cos_phi: int | None, percent: float | None
+    ) -> None:
+        """Remember one way of setting the reactive power, forgetting the others."""
+        self.reactive_power_setpoint = var
+        self.cos_phi_setpoint = cos_phi
+        self.reactive_power_percent_setpoint = percent
 
     async def async_write_feed_in_limit(self, watts: int) -> None:
         """Cap the power fed into the grid; rewrite within 30 seconds to keep it."""
-        await _write_int32(self._unit, 40186, _feed_in_limit(watts))
+        checked = _int(watts, 0, INT32_MAX, "feed-in limit")
+        await _write_int32(self._unit, self.state, FEED_IN_LIMIT, checked)
 
     async def async_write_reactive_power(self, var: int) -> None:
         """Set the reactive power, in var.
@@ -124,22 +210,40 @@ class GridControl(E3dcComponent):
         The manual allows ±50 % of the rated apparent power, which the device
         enforces. This checks only that the value fits the register.
         """
-        await self._unit.write_register(register(40189), _int16(var))
+        checked = _int(var, INT16_MIN, INT16_MAX, "reactive power")
+        await self._unit.write_register(register(REACTIVE_POWER), _word(checked))
+        self._set_reactive(checked, None, None)
 
     async def async_write_cos_phi(self, value: int) -> None:
         """Set the reactive power as cos φ, from -600 (0.4 capacitive) to 600."""
-        if not -600 <= value <= 600:
-            raise ValueError(f"cos φ setpoint {value} is outside -600-600")
-        await self._unit.write_register(register(40190), _int16(value))
+        checked = _int(value, COS_PHI_MIN, COS_PHI_MAX, "cos φ setpoint")
+        await self._unit.write_register(register(COS_PHI), _word(checked))
+        self._set_reactive(None, checked, None)
 
     async def async_write_reactive_power_percent(self, percent: float) -> None:
         """Set the reactive power as a percentage of the rated apparent power."""
-        await _write_tenths(self._unit, 40191, percent, -100, 100)
+        checked = await _write_tenths(
+            self._unit, REACTIVE_POWER_PERCENT, percent, PERCENT_MIN, PERCENT_MAX
+        )
+        self._set_reactive(None, None, checked)
 
     async def async_write_active_power_limit(self, percent: float) -> None:
         """Cap the inverter's active power, ignoring the house's consumption."""
-        await _write_tenths(self._unit, 40192, percent, 0, 100)
-        self.active_power_limit_setpoint = percent
+        self.active_power_limit_setpoint = await _write_tenths(
+            self._unit, ACTIVE_POWER_LIMIT, percent, 0, PERCENT_MAX
+        )
+
+    async def async_write_active_power_failsafe(self, percent: float) -> None:
+        """Set the active power limit that applies once a setpoint times out."""
+        self.active_power_failsafe_setpoint = await _write_tenths(
+            self._unit, ACTIVE_POWER_FAILSAFE, percent, 0, PERCENT_MAX
+        )
+
+    async def async_write_reactive_power_failsafe(self, percent: float) -> None:
+        """Set the reactive power that applies once a setpoint times out."""
+        self.reactive_power_failsafe_setpoint = await _write_tenths(
+            self._unit, REACTIVE_POWER_FAILSAFE, percent, 0, PERCENT_MAX
+        )
 
     async def async_write_active_power_failsafe_timeout(self, seconds: int) -> None:
         """Set how long an active power setpoint holds; 0 turns the failsafe off."""
@@ -149,17 +253,20 @@ class GridControl(E3dcComponent):
         """Set how long a reactive power setpoint holds; 0 turns the failsafe off."""
         await self.write("reactive_power_failsafe_timeout", seconds)
 
-    async def async_write_active_power_failsafe(self, percent: float) -> None:
-        """Set the active power limit that applies once a setpoint times out."""
-        await _write_tenths(self._unit, 40193, percent, 0, 100)
 
-    async def async_write_reactive_power_failsafe(self, percent: float) -> None:
-        """Set the reactive power that applies once a setpoint times out."""
-        await _write_tenths(self._unit, 40195, percent, 0, 100)
+class GridStatus(E3dcComponent):
+    """Whether the system can deliver power, from release 2025_06."""
+
+    power_output_ready = boolean(register(40188))
+    """PV inverter on the grid, DC-DC converter working, battery dischargeable."""
 
 
 class BatteryControl(E3dcComponent):
-    """Remote control of the battery power, from release 2025_40."""
+    """Remote control of the battery power, from release 2025_40.
+
+    On 2026_04 and later the battery power can also be set as a percentage,
+    through ``BatteryLimits.async_write_battery_power_percent()``.
+    """
 
     register_ranges = ((register(40199), register(40199)),)
 
@@ -167,10 +274,14 @@ class BatteryControl(E3dcComponent):
     """1 disables remote battery control at once. The manual says 0 has no effect."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        """Initialize the component and the setpoint it remembers."""
+        """Initialize the component."""
         super().__init__(*args, **kwargs)
-        self.battery_power_setpoint: int | None = None
-        """The last battery power written, in W, or ``None`` after a stop."""
+        self.state = ControlState()
+
+    @property
+    def battery_power_setpoint(self) -> int | None:
+        """The last battery power acknowledged, in W, or ``None`` after a stop."""
+        return self.state.battery_power
 
     async def async_write_battery_power(self, watts: int) -> None:
         """Charge (positive) or discharge (negative) the battery at ``watts``.
@@ -178,17 +289,26 @@ class BatteryControl(E3dcComponent):
         PV power charges first and the grid makes up the rest. The device
         returns to normal control unless this is rewritten within 30 seconds.
         """
-        await _write_int32(self._unit, 40197, watts)
-        self.battery_power_setpoint = watts
+        checked = _int(watts, INT32_MIN, INT32_MAX, "battery power")
+        try:
+            await _write_int32(self._unit, self.state, BATTERY_POWER, checked)
+        except InconsistentWriteError:
+            self.state.clear_battery()
+            raise
+        self.state.clear_battery()
+        self.state.battery_power = checked
 
     async def async_stop_remote_control(self) -> None:
         """End remote battery control at once, without waiting for its timeout."""
         await self.write("remote_control_disabled", True)
-        self.battery_power_setpoint = None
+        self.state.clear_battery()
 
     async def async_write_remote_control_disabled(self, disabled: bool) -> None:
-        """Write register 40199 directly, for example to clear it again."""
-        await self.write("remote_control_disabled", disabled)
+        """Write register 40199. True does what ``async_stop_remote_control`` does."""
+        if _flag(disabled):
+            await self.async_stop_remote_control()
+        else:
+            await self.write("remote_control_disabled", False)
 
 
 class InverterModeControl(E3dcComponent):
@@ -197,9 +317,10 @@ class InverterModeControl(E3dcComponent):
     register_ranges = ((register(40200), register(40201)),)
 
     inverter_mode_request = enum(
-        register(40200), InverterModeRequest, signed=True, writable=True
+        register(40200), InverterModeRequest, signed=True, writable=_mode_request
     )
     inverter_mode = enum(register(40201), InverterMode, signed=True)
+    """The mode in effect, which the device changes on its own."""
 
     async def async_write_inverter_mode(self, mode: InverterModeRequest) -> None:
         """Force an inverter operating mode, or hand control back."""
@@ -207,7 +328,11 @@ class InverterModeControl(E3dcComponent):
 
 
 class BatteryLimits(E3dcComponent):
-    """What the battery can take and give right now, from release 2026_04."""
+    """What the battery can take and give right now, from release 2026_04.
+
+    It also carries the percentage battery write, which arrived with the same
+    release. The watt write is ``BatteryControl.async_write_battery_power()``.
+    """
 
     max_charge_power = int32(register(40202), word_order="little", unit="W")
     max_discharge_power = int32(register(40204), word_order="little", unit="W")
@@ -216,10 +341,14 @@ class BatteryLimits(E3dcComponent):
     full_charge_energy = int32(register(40208), word_order="little", unit="Wh")
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        """Initialize the component and the setpoint it remembers."""
+        """Initialize the component."""
         super().__init__(*args, **kwargs)
-        self.battery_power_percent_setpoint: float | None = None
-        """The last battery power percentage written, or ``None``."""
+        self.state = ControlState()
+
+    @property
+    def battery_power_percent_setpoint(self) -> float | None:
+        """The last battery power percentage acknowledged, or ``None``."""
+        return self.state.battery_power_percent
 
     async def async_write_battery_power_percent(self, percent: float) -> None:
         """Charge (positive) or discharge (negative) at a share of full power.
@@ -227,5 +356,8 @@ class BatteryLimits(E3dcComponent):
         The manual lists register 40210 with length 1 and type Int32. This
         writes one signed 16-bit register.
         """
-        await _write_tenths(self._unit, 40210, percent, -100, 100)
-        self.battery_power_percent_setpoint = percent
+        checked = await _write_tenths(
+            self._unit, BATTERY_POWER_PERCENT, percent, PERCENT_MIN, PERCENT_MAX
+        )
+        self.state.clear_battery()
+        self.state.battery_power_percent = checked

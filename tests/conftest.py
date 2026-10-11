@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from modbus_connection.encode import encode_int, encode_string
 from modbus_connection.mock import MockModbusUnit
 
 from e3dc_ess_modbus import E3dcPowerStation
@@ -10,15 +11,13 @@ from e3dc_ess_modbus.model import register
 
 
 def ascii_words(text: str, length: int) -> list[int]:
-    """Pack ASCII into ``length`` registers, two characters each (hi, lo)."""
-    padded = text.ljust(length * 2, "\0")[: length * 2]
-    return [(ord(padded[i]) << 8) | ord(padded[i + 1]) for i in range(0, length * 2, 2)]
+    """Pack ASCII into ``length`` registers."""
+    return encode_string(text, length=length)
 
 
 def int32_words(value: int) -> list[int]:
     """An int32 as E3/DC sends it, low word first."""
-    raw = value & 0xFFFFFFFF
-    return [raw & 0xFFFF, raw >> 16]
+    return encode_int(value, count=2, word_order="little")
 
 
 SERIAL = "S10-12345678912"

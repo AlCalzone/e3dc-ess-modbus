@@ -19,6 +19,9 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Check the tag is a version
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([ab]|rc)?[0-9]*$ ]]
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # Only a tag can be published, never a branch or a commit
@@ -30,6 +33,10 @@ jobs:
         with:
           # A cache restored from another run must not feed the release artifact
           enable-cache: false
+      - name: Run the tests
+        run: |
+          uv sync --locked
+          uv run pytest
       - name: Set package version from release tag
         run: |
           VERSION="${RELEASE_TAG#v}"
@@ -46,6 +53,7 @@ jobs:
 
   publish:
     needs: build
+    if: github.ref_type == 'tag' || github.event_name == 'release'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
