@@ -57,7 +57,7 @@ Every value is `None` until the first update. Each update returns an `UpdateRepo
 - **Setpoints expire:** the feed-in limit and the battery power lapse 30 seconds after the last write. The active power limit and the reactive power setpoints hold for the failsafe timeouts, 30 seconds by default. A timeout of 0 keeps them until the next write.
 - **Holding a setpoint:** the library writes a setpoint once and never repeats it. To hold one, write it again before its timeout runs out. The `*_setpoint` attributes keep the last value written that the device acknowledged, as encoded. They don't clear when the setpoint lapses, only when the connection drops.
 - **Reading back a write:** a write doesn't refresh the cached values. Call `await async_update_settings()` to read back what took effect.
-- **Two-register writes:** the feed-in limit and the battery power go out as one FC16 write. If the device refuses FC16, the library logs it once and sends two single-register writes from then on. Between those two writes, the register pair holds a value that is neither the old nor the new one. If the second write fails, the library ends remote battery control, or writes the old feed-in limit back, and raises `InconsistentWriteError`.
+- **Two-register writes:** the feed-in limit and the battery power go out as one FC16 write. If the device refuses FC16 as an illegal function, the library logs it once and sends two single-register writes from then on. Between those two writes, the register pair holds a value that is neither the old nor the new one. If the pair may be left that way, by an error or a cancellation, the library ends remote battery control, or writes the last feed-in limit back, before it raises. Writes to the battery and the feed-in limit wait for each other, so they reach the device in the order they were made.
 - **Feed-in limit:** `feed_in_limit` reads back the last value written. The limit in effect may differ.
 - **Wallbox bits:** which bits a wallbox uses depends on its model. Unused bits stay unset.
 - **Testing:** built against the vendor's Modbus TCP manual, version 2.80, and tested against modbus-connection's mock. It has not been tested on real hardware.
@@ -126,12 +126,12 @@ Each `Wallbox` has:
 - `solar_mode`: charging from solar only. Unset means hybrid mode.
 - `one_phase`: charging on one phase. Unset means three.
 - `type2_plugged`, `type2_locked`: the type 2 plug is plugged in, or locked.
-- `schuko_on`, `schuko_plugged`, `schuko_locked`: the type F socket is on, plugged in, or locked.
+- `schuko_on`, `schuko_plugged`, `schuko_locked`: the type F socket is on, plugged in, or locked. Only the Wallbox classic can switch the socket.
 - `relay_16a_1p`, `relay_16a_3p`, `relay_32a_3p`: which relay is closed.
 - `await async_write_charging_allowed(allowed)`: allow or abort charging.
 - `await async_write_solar_mode(enabled)`: charge from solar only, or in hybrid mode.
 - `await async_write_one_phase(enabled)`: charge on one phase, or on three.
-- `await async_write_schuko_on(on)`: switch the type F socket on or off.
+- `await async_write_schuko_on(on)`: switch the type F socket on or off, on a Wallbox classic.
 
 ### `power_meters` (`PowerMeters`)
 
@@ -209,7 +209,7 @@ Optional. Present on firmware 2026_04 or later.
 
 Optional. Present when any inverter slot answers.
 
-A mapping of slot number to `Inverter`, with every slot that answers its registers. Inverter 0 is the device's own. Slots 1 to 7 are for additional solar inverters, and an empty slot may answer with zeros.
+A mapping of slot number to `Inverter`, with every slot that answers its registers. Inverter 0 is the device's own. Slots 1 to 7 are for additional solar inverters, and an empty slot may answer with zeros. A slot that fails during setup stays absent until a new `E3dcPowerStation` sets up.
 
 - `is_connected`: the inverter reports a grid voltage.
 - `active_power_l1` to `active_power_l3`: active power per phase, in W.
@@ -236,7 +236,7 @@ All errors the library raises itself derive from `E3dcError`. Transport and devi
 
 - `NotAnE3dcError`: the device refused the identity block, or didn't identify as an E3/DC power station in E3DC mode. Raised by `async_detect()` and the first update.
 - `InvalidValueError`: a value to write is out of range or of the wrong type. It is also a `ValueError`. Nothing is written.
-- `InconsistentWriteError`: on a device that refuses FC16, the first half of a two-register setpoint was written and the second failed. The library has tried to restore a safe state and forgotten the setpoint.
+- `InconsistentWriteError`: on a device that refuses FC16, a two-register setpoint failed after its first half may have landed. The library has written 1 to 40199 for the battery power, or the last feed-in limit for the feed-in limit, and forgotten the setpoint.
 - `ModbusConnectionError`: the connection was lost.
 - `ModbusTimeoutError`: the device didn't answer before any component had refreshed.
 - `ModbusExceptionError`: the device refused a write, for example a setpoint on firmware that doesn't support it.

@@ -439,7 +439,7 @@ async def test_a_half_written_pair_raises_and_forgets_the_setpoint(
 
     assert isinstance(err.value.__cause__, ModbusTimeoutError)
     assert battery.battery_power_setpoint is None
-    assert "Register 40197 took its new low word" in caplog.text
+    assert "Writing 500 to registers 40197 and 40198 failed halfway" in caplog.text
 
 
 async def test_concurrent_wallbox_writes_keep_both_bits(
@@ -485,43 +485,223 @@ async def test_a_half_written_battery_power_stops_remote_control(
     assert [(w.address, w.values) for w in writes][-1] == (register(40199), [1])
 
 
-async def test_a_half_written_feed_in_limit_restores_the_old_low_word(
-    station: E3dcPowerStation,
-    mock_modbus_unit: MockModbusUnit,
-    writes: list[WriteEvent],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def _refuse_fc16(monkeypatch: pytest.MonkeyPatch, unit: MockModbusUnit) -> None:
     async def refuse(address: int, values: list[int]) -> None:
         raise IllegalFunctionError()
 
+    monkeypatch.setattr(unit, "write_registers", refuse)
+
+
+def _fail_once(
+    monkeypatch: pytest.MonkeyPatch,
+    unit: MockModbusUnit,
+    index: int,
+    error: BaseException,
+    *,
+    lands: bool,
+) -> None:
+    """Make the next FC06 write to register ``index`` raise, landing or not."""
+    write = unit.write_register
+    armed = True
+
+    async def failing(address: int, value: int) -> None:
+        nonlocal armed
+        if armed and address == register(index):
+            armed = False
+            if lands:
+                await write(address, value)
+            raise error
+        await write(address, value)
+
+    monkeypatch.setattr(unit, "write_register", failing)
+
+
+def _pair(unit: MockModbusUnit, index: int) -> int:
+    low, high = unit.holding[register(index)], unit.holding[register(index + 1)]
+    assert isinstance(low, int)
+    assert isinstance(high, int)
+    raw = low | high << 16
+    return raw - (1 << 32) if raw >= 1 << 31 else raw
+
+
+async def test_a_half_written_feed_in_limit_restores_the_last_one_written(
+    station: E3dcPowerStation,
+    mock_modbus_unit: MockModbusUnit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     await station.async_update_settings()
-    monkeypatch.setattr(station.modbus_unit, "write_registers", refuse)
-    mock_modbus_unit.fail_write(register(40187), ModbusTimeoutError())
+    _refuse_fc16(monkeypatch, mock_modbus_unit)
+    grid = station.grid_control
+    assert grid is not None
+    await grid.async_write_feed_in_limit(70000)
+    _fail_once(monkeypatch, mock_modbus_unit, 40187, ModbusTimeoutError(), lands=False)
+
+    with pytest.raises(InconsistentWriteError):
+        await grid.async_write_feed_in_limit(3000)
+
+    assert _pair(mock_modbus_unit, 40186) == 70000
+
+
+async def test_a_landed_high_word_is_restored_too(
+    station: E3dcPowerStation,
+    mock_modbus_unit: MockModbusUnit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await station.async_update_settings()
+    _refuse_fc16(monkeypatch, mock_modbus_unit)
+    _fail_once(monkeypatch, mock_modbus_unit, 40187, ModbusTimeoutError(), lands=True)
     assert station.grid_control is not None
 
     with pytest.raises(InconsistentWriteError):
         await station.grid_control.async_write_feed_in_limit(70000)
 
-    assert [(w.address, w.values) for w in writes] == [
-        (register(40186), [70000 & 0xFFFF]),
-        (register(40186), [5000]),
-    ]
-    assert mock_modbus_unit.holding[register(40186)] == 5000
+    assert _pair(mock_modbus_unit, 40186) == 5000
 
 
-async def test_fc16_refused_as_illegal_address_falls_back(
+async def test_an_illegal_address_does_not_switch_off_fc16(
     station: E3dcPowerStation,
     writes: list[WriteEvent],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def refuse(address: int, values: list[int]) -> None:
-        raise IllegalDataAddressError()
+    write_registers = station.modbus_unit.write_registers
 
-    monkeypatch.setattr(station.modbus_unit, "write_registers", refuse)
+    async def refuse_feed_in(address: int, values: list[int]) -> None:
+        if address == register(40186):
+            raise IllegalDataAddressError()
+        await write_registers(address, values)
+
+    monkeypatch.setattr(station.modbus_unit, "write_registers", refuse_feed_in)
+    assert station.grid_control is not None
     assert station.battery_control is not None
-    await station.battery_control.async_write_battery_power(-3000)
+    with pytest.raises(IllegalDataAddressError):
+        await station.grid_control.async_write_feed_in_limit(4000)
+    await station.battery_control.async_write_battery_power(3000)
 
-    assert [w.function_code for w in writes] == [0x06, 0x06]
+    assert not station.battery_control.state.fc16_refused
+    assert [w.function_code for w in writes] == [0x10]
+
+
+async def test_a_low_word_that_landed_without_a_reply_stops_remote_control(
+    station: E3dcPowerStation,
+    mock_modbus_unit: MockModbusUnit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await station.async_ensure_setup()
+    _refuse_fc16(monkeypatch, mock_modbus_unit)
+    battery = station.battery_control
+    assert battery is not None
+    await battery.async_write_battery_power(-3000)
+    _fail_once(monkeypatch, mock_modbus_unit, 40197, ModbusTimeoutError(), lands=True)
+
+    with pytest.raises(InconsistentWriteError):
+        await battery.async_write_battery_power(3000)
+
+    assert mock_modbus_unit.holding[register(40199)] == 1
+    assert battery.battery_power_setpoint is None
+
+
+async def test_a_refused_low_word_needs_no_restore(
+    station: E3dcPowerStation,
+    mock_modbus_unit: MockModbusUnit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await station.async_ensure_setup()
+    _refuse_fc16(monkeypatch, mock_modbus_unit)
+    battery = station.battery_control
+    assert battery is not None
+    await battery.async_write_battery_power(-3000)
+    mock_modbus_unit.fail_write(register(40197), IllegalDataValueError())
+
+    with pytest.raises(IllegalDataValueError):
+        await battery.async_write_battery_power(3000)
+
+    assert mock_modbus_unit.holding[register(40199)] == 0
+    assert battery.battery_power_setpoint == -3000
+
+
+async def test_cancelling_between_the_writes_restores_a_safe_state(
+    station: E3dcPowerStation,
+    mock_modbus_unit: MockModbusUnit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await station.async_ensure_setup()
+    _refuse_fc16(monkeypatch, mock_modbus_unit)
+    battery = station.battery_control
+    assert battery is not None
+    await battery.async_write_battery_power(-3000)
+    write = mock_modbus_unit.write_register
+    started = asyncio.Event()
+
+    async def slow(address: int, value: int) -> None:
+        if address == register(40198):
+            started.set()
+            await asyncio.sleep(1)
+        await write(address, value)
+
+    monkeypatch.setattr(mock_modbus_unit, "write_register", slow)
+    task = asyncio.create_task(battery.async_write_battery_power(3000))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert mock_modbus_unit.holding[register(40199)] == 1
+    assert battery.battery_power_setpoint is None
+
+
+async def test_concurrent_battery_writes_reach_the_device_in_order(
+    station: E3dcPowerStation,
+    mock_modbus_unit: MockModbusUnit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await station.async_ensure_setup()
+    _refuse_fc16(monkeypatch, mock_modbus_unit)
+    write = mock_modbus_unit.write_register
+
+    async def yielding(address: int, value: int) -> None:
+        await asyncio.sleep(0.01 if address == register(40198) else 0)
+        await write(address, value)
+
+    monkeypatch.setattr(mock_modbus_unit, "write_register", yielding)
+    battery = station.battery_control
+    assert battery is not None
+    await asyncio.gather(
+        battery.async_write_battery_power(3000),
+        battery.async_write_battery_power(-3000),
+    )
+
+    assert _pair(mock_modbus_unit, 40197) == battery.battery_power_setpoint == -3000
+
+
+async def test_writing_40199_directly_forgets_the_battery_setpoint(
+    station: E3dcPowerStation, writes: list[WriteEvent]
+) -> None:
+    battery = station.battery_control
+    assert battery is not None
+    await battery.async_write_battery_power(1000)
+
+    await battery.write("remote_control_disabled", True)
+
+    assert battery.battery_power_setpoint is None
+
+
+@pytest.mark.parametrize(
+    ("method", "value"),
+    [
+        pytest.param("async_write_charging_allowed", "false", id="charging_str"),
+        pytest.param("async_write_schuko_on", 0.0, id="schuko_float"),
+        pytest.param("async_write_solar_mode", 1, id="solar_int"),
+    ],
+)
+async def test_wallbox_writes_take_only_bools(
+    station: E3dcPowerStation, writes: list[WriteEvent], method: str, value: Any
+) -> None:
+    await station.async_update_readings()
+
+    with pytest.raises(InvalidValueError):
+        await getattr(station.wallboxes.slots[0], method)(value)
+
+    assert writes == []
 
 
 async def test_a_dropped_connection_forgets_the_setpoints(
@@ -560,3 +740,21 @@ async def test_errors_name_the_field(
     assert station.grid_control is not None
     with pytest.raises(InvalidValueError, match="timeout"):
         await station.grid_control.async_write_active_power_failsafe_timeout(1.7)  # type: ignore[arg-type]
+
+
+async def test_a_stuck_high_register_still_gets_the_old_low_word_back(
+    station: E3dcPowerStation,
+    mock_modbus_unit: MockModbusUnit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await station.async_update_settings()
+    _refuse_fc16(monkeypatch, mock_modbus_unit)
+    grid = station.grid_control
+    assert grid is not None
+    await grid.async_write_feed_in_limit(70000)
+    mock_modbus_unit.fail_write(register(40187), ModbusTimeoutError())
+
+    with pytest.raises(InconsistentWriteError):
+        await grid.async_write_feed_in_limit(3000)
+
+    assert _pair(mock_modbus_unit, 40186) == 70000

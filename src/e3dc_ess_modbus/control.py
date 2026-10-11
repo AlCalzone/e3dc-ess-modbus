@@ -17,12 +17,16 @@ setpoint lapses, only when the connection drops.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, NoReturn
 
-from modbus_connection import IllegalDataAddressError, IllegalFunctionError, ModbusError
+from modbus_connection import (
+    IllegalFunctionError,
+    ModbusExceptionError,
+)
 from modbus_connection.encode import encode_int
 from modbus_connection.model import boolean, enum, int32, integer
 
@@ -49,6 +53,7 @@ ACTIVE_POWER_LIMIT = 40192
 ACTIVE_POWER_FAILSAFE = 40193
 REACTIVE_POWER_FAILSAFE = 40195
 BATTERY_POWER = 40197
+REMOTE_CONTROL_DISABLED = 40199
 BATTERY_POWER_PERCENT = 40210
 
 
@@ -57,11 +62,16 @@ class ControlState:
     """What the control components of one power station share."""
 
     fc16_refused: bool = False
-    """The device refused an FC16 write, so int32 setpoints take two FC06 writes."""
+    """The device refused FC16 as an illegal function, so int32 setpoints take
+    two FC06 writes."""
     battery_power: int | None = None
     """The last battery power acknowledged, in W."""
     battery_power_percent: float | None = None
     """The last battery power percentage acknowledged."""
+    feed_in_limit: int | None = None
+    """The last feed-in limit written or read, in W."""
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    """Held across each battery and feed-in write, so they reach the device in order."""
 
     def clear_battery(self) -> None:
         """Forget the battery setpoint, after a stop or a failed write."""
@@ -128,16 +138,20 @@ async def _write_int32(
 ) -> None:
     """Write a checked signed 32-bit value to register ``index`` and the next one.
 
-    The manual lists no FC16 for this device, but one FC16 write is the only
-    way to change both words at once. A device that refuses FC16 gets two FC06
-    writes, low word first, for the rest of the session. If the second write
-    fails, ``restore`` puts the device back into a safe state before this raises.
+    Call only while holding ``state.lock``. The manual lists no FC16 for this
+    device, but one FC16 write is the only way to change both words at once.
+    A device that refuses FC16 as an illegal function gets two FC06 writes,
+    low word first, for the rest of the session.
+
+    A failure after the low word may have landed leaves the pair holding
+    neither value. ``restore`` then runs, shielded from cancellation, before
+    this raises ``InconsistentWriteError``, or re-raises a cancellation.
     """
     low, high = encode_int(value, count=2, word_order="little")
     if not state.fc16_refused:
         try:
             await unit.write_registers(register(index), [low, high])
-        except (IllegalFunctionError, IllegalDataAddressError):
+        except IllegalFunctionError:
             _LOGGER.warning(
                 "The power station refuses FC16, so two-register setpoints now "
                 "take two single-register writes"
@@ -145,23 +159,42 @@ async def _write_int32(
             state.fc16_refused = True
         else:
             return
-    await unit.write_register(register(index), low)
+    try:
+        await unit.write_register(register(index), low)
+    except ModbusExceptionError:
+        raise  # an exception response means the low word didn't land
+    except BaseException as err:
+        await _async_restore_and_raise(index, value, restore, err)
     try:
         await unit.write_register(register(index + 1), high)
-    except ModbusError as err:
-        _LOGGER.warning(
-            "Register %d took its new low word, but register %d refused its high "
-            "word: the pair holds neither the old nor the new value",
-            index,
-            index + 1,
-        )
-        try:
-            await restore()
-        except ModbusError as restore_err:
-            _LOGGER.warning("Restoring a safe state failed too: %s", restore_err)
-        raise InconsistentWriteError(
-            f"registers {index} and {index + 1} hold half of {value}"
-        ) from err
+    except BaseException as err:
+        await _async_restore_and_raise(index, value, restore, err)
+
+
+async def _async_restore_and_raise(
+    index: int,
+    value: int,
+    restore: Callable[[], Awaitable[None]],
+    err: BaseException,
+) -> NoReturn:
+    """Restore a safe state after a half-written pair, then raise."""
+    _LOGGER.warning(
+        "Writing %d to registers %d and %d failed halfway (%r): the pair may hold "
+        "neither the old nor the new value, restoring a safe state",
+        value,
+        index,
+        index + 1,
+        err,
+    )
+    try:
+        await asyncio.shield(restore())
+    except Exception as restore_err:  # noqa: BLE001
+        _LOGGER.warning("Restoring a safe state failed too: %r", restore_err)
+    if not isinstance(err, Exception):
+        raise err
+    raise InconsistentWriteError(
+        f"writing {value} to registers {index} and {index + 1} failed halfway"
+    ) from err
 
 
 class GridControl(E3dcComponent):
@@ -191,6 +224,7 @@ class GridControl(E3dcComponent):
         """Initialize the component and the setpoints it remembers."""
         super().__init__(*args, **kwargs)
         self.state = ControlState()
+        self.add_update_listener(self._note_feed_in_limit)
         self.reactive_power_setpoint: int | None = None
         """The last reactive power acknowledged, in var."""
         self.cos_phi_setpoint: int | None = None
@@ -203,6 +237,11 @@ class GridControl(E3dcComponent):
         """The last active power failsafe acknowledged, in %."""
         self.reactive_power_failsafe_setpoint: float | None = None
         """The last reactive power failsafe acknowledged, in %."""
+
+    def _note_feed_in_limit(self) -> None:
+        """Remember the feed-in limit read, which is the last one written."""
+        if self.feed_in_limit is not None:
+            self.state.feed_in_limit = self.feed_in_limit
 
     def clear_setpoints(self) -> None:
         """Forget every setpoint, for example after the connection dropped."""
@@ -222,18 +261,31 @@ class GridControl(E3dcComponent):
     async def async_write_feed_in_limit(self, watts: int) -> None:
         """Cap the power fed into the grid; rewrite within 30 seconds to keep it.
 
-        If only the low word lands, the old low word is written back. The pair
-        then holds the old limit, which this read last.
+        If the write fails halfway, both words of the last limit written or
+        read go back, high word first. Without one, the pair stays as it is
+        until the limit lapses.
         """
         checked = _int(watts, 0, INT32_MAX, "feed_in_limit")
-        previous = self.feed_in_limit
+        async with self.state.lock:
+            previous = self.state.feed_in_limit
 
-        async def restore() -> None:
-            if previous is not None:
-                old_low = encode_int(previous, count=2, word_order="little")[0]
-                await self._unit.write_register(register(FEED_IN_LIMIT), old_low)
+            async def restore() -> None:
+                self.state.feed_in_limit = None
+                if previous is None:
+                    return
+                old_low, old_high = encode_int(previous, count=2, word_order="little")
+                try:
+                    await self._unit.write_register(
+                        register(FEED_IN_LIMIT + 1), old_high
+                    )
+                finally:
+                    # The high word may never have changed, so the low word
+                    # alone can still bring the old limit back
+                    await self._unit.write_register(register(FEED_IN_LIMIT), old_low)
+                self.state.feed_in_limit = previous
 
-        await _write_int32(self._unit, self.state, FEED_IN_LIMIT, checked, restore)
+            await _write_int32(self._unit, self.state, FEED_IN_LIMIT, checked, restore)
+            self.state.feed_in_limit = checked
 
     async def async_write_reactive_power(self, var: int) -> None:
         """Set the reactive power, in var.
@@ -339,25 +391,29 @@ class BatteryControl(E3dcComponent):
 
         PV power charges first and the grid makes up the rest. The device
         returns to normal control unless this is rewritten within 30 seconds.
-        If only the low word lands, writing 1 to 40199 ends remote control.
+        If the write fails halfway, writing 1 to 40199 ends remote control.
         """
         checked = _int(watts, INT32_MIN, INT32_MAX, "battery_power")
+        async with self.state.lock:
 
-        async def restore() -> None:
-            await self.write("remote_control_disabled", True)
+            async def restore() -> None:
+                self.state.clear_battery()
+                await self._unit.write_register(register(REMOTE_CONTROL_DISABLED), 1)
 
-        try:
             await _write_int32(self._unit, self.state, BATTERY_POWER, checked, restore)
-        except InconsistentWriteError:
             self.state.clear_battery()
-            raise
-        self.state.clear_battery()
-        self.state.battery_power = checked
+            self.state.battery_power = checked
 
     async def async_stop_remote_control(self) -> None:
         """End remote battery control at once, without waiting for its timeout."""
         await self.write("remote_control_disabled", True)
-        self.state.clear_battery()
+
+    async def write(self, field: str, value: Any) -> None:
+        """Write a field, keeping the battery setpoint in step with 40199."""
+        async with self.state.lock:
+            await super().write(field, value)
+            if field == "remote_control_disabled" and value is True:
+                self.state.clear_battery()
 
     async def async_write_remote_control_disabled(self, disabled: bool) -> None:
         """Write register 40199. True does what ``async_stop_remote_control`` does."""
@@ -414,13 +470,14 @@ class BatteryLimits(E3dcComponent):
         The manual lists register 40210 with length 1 and type Int32. This
         writes one signed 16-bit register.
         """
-        checked = await _write_tenths(
-            self._unit,
-            BATTERY_POWER_PERCENT,
-            percent,
-            PERCENT_MIN,
-            PERCENT_MAX,
-            "battery_power_percent",
-        )
-        self.state.clear_battery()
-        self.state.battery_power_percent = checked
+        async with self.state.lock:
+            checked = await _write_tenths(
+                self._unit,
+                BATTERY_POWER_PERCENT,
+                percent,
+                PERCENT_MIN,
+                PERCENT_MAX,
+                "battery_power_percent",
+            )
+            self.state.clear_battery()
+            self.state.battery_power_percent = checked

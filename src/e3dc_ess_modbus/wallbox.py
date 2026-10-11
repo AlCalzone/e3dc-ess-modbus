@@ -8,6 +8,7 @@ from typing import Any
 from modbus_connection import ModbusError
 from modbus_connection.model import bit, repeating_group
 
+from .errors import InvalidValueError
 from .model import E3dcComponent, register
 
 WALLBOX_COUNT = 8
@@ -32,7 +33,11 @@ class Wallbox(E3dcComponent):
     type2_plugged = bit(register(40088), 5)
     """Multi connect and efy wallboxes set this only with a vehicle attached."""
     schuko_on = bit(register(40088), 6, writable=True)
-    """The type F (CEE 7/3) socket is switched on."""
+    """The type F (CEE 7/3) socket is switched on.
+
+    Only the Wallbox classic can switch it. Multi connect I reports it read-only,
+    and the other models don't have it.
+    """
     schuko_plugged = bit(register(40088), 7)
     schuko_locked = bit(register(40088), 8)
     relay_16a_1p = bit(register(40088), 9)
@@ -60,6 +65,8 @@ class Wallbox(E3dcComponent):
 
     async def _async_write_bit(self, field: str, value: bool) -> None:
         """Set one bit, one read-modify-write of the word at a time."""
+        if not isinstance(value, bool):
+            raise InvalidValueError(f"{field} {value!r} is not a bool")
         async with self._write_lock:
             try:
                 await self.write(field, value)
@@ -73,10 +80,12 @@ class Wallbox(E3dcComponent):
 
     async def async_write_charging_allowed(self, allowed: bool) -> None:
         """Allow charging, or abort it, through ``charging_aborted``."""
+        if not isinstance(allowed, bool):
+            raise InvalidValueError(f"charging_allowed {allowed!r} is not a bool")
         await self._async_write_bit("charging_aborted", not allowed)
 
     async def async_write_schuko_on(self, on: bool) -> None:
-        """Switch the type F socket on or off."""
+        """Switch the type F socket on or off, on a Wallbox classic only."""
         await self._async_write_bit("schuko_on", on)
 
     async def async_write_one_phase(self, enabled: bool) -> None:

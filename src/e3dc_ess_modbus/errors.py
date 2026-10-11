@@ -28,8 +28,10 @@ class InvalidValueError(E3dcError, ValueError):
 
 
 class InconsistentWriteError(E3dcError):
-    """Half of a two-register setpoint was written, and the other half failed.
+    """A two-register setpoint failed after its first half may have landed.
 
-    The register pair holds the new low word next to the old high word until
-    the setpoint lapses or is written again.
+    The library has tried to restore a safe state. For the battery power, 1
+    went to 40199, which ends remote battery control. For the feed-in limit,
+    the last limit written or read went back to 40186 and 40187. The cause
+    is chained.
     """

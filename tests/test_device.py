@@ -547,3 +547,19 @@ async def test_public_polls_track_meter_freshness(
 
 def test_an_empty_meter_slot_has_no_type(station: E3dcPowerStation) -> None:
     assert station.power_meter_readings[2].meter_type is None
+
+
+async def test_meter_listeners_see_this_polls_freshness(
+    station: E3dcPowerStation,
+) -> None:
+    await station.async_ensure_setup()
+    seen: list[int | None] = []
+    for component in (station.wide_power_meters, station.power_meters):
+        assert component is not None
+        component.add_update_listener(
+            lambda: seen.append(station.power_meter_readings[0].power_l1)
+        )
+
+    await station.async_update_readings()
+
+    assert seen == [-40000, -40000]

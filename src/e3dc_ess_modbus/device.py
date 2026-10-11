@@ -41,12 +41,14 @@ _LOGGER = logging.getLogger(__name__)
 # The manual allows at most 10 requests per second.
 MESSAGE_SPACING = 0.1
 
+# The 32-bit meters come before the 16-bit ones, so that both are marked
+# fresh when the 16-bit block's listeners run.
 READINGS = (
     "power",
     "dc_strings",
     "wallboxes",
-    "power_meters",
     "wide_power_meters",
+    "power_meters",
     "grid_status",
     "inverter_mode_control",
     "battery_limits",
@@ -100,6 +102,7 @@ class E3dcPowerStation(Device):
         self._fresh_meter_blocks: set[str] = set()
         self._control_state = ControlState()
         unit.on_connection_lost(self._forget_setpoints)
+        self._note_fresh_on_update(self.power_meters, "power_meters")
 
     @classmethod
     async def async_detect(
@@ -170,6 +173,7 @@ class E3dcPowerStation(Device):
         self.wide_power_meters = await self._async_probe(WidePowerMeters(unit))
         if self.wide_power_meters is not None:
             self._fresh_meter_blocks.add("wide_power_meters")
+            self._note_fresh_on_update(self.wide_power_meters, "wide_power_meters")
         self.grid_status = await self._async_probe(GridStatus(unit))
         self.grid_control = await self._async_probe(GridControl(unit))
         self.battery_control = await self._async_probe(BatteryControl(unit))
@@ -218,7 +222,7 @@ class E3dcPowerStation(Device):
         A slot without an inverter may answer with zeros. ``is_connected``
         tells the two apart once the inverter reports a grid voltage. Once
         slot 0 has answered, any refusal or timeout of an additional slot
-        means that slot is absent.
+        means that slot is absent until a new ``E3dcPowerStation`` sets up.
         """
         found: dict[int, Inverter] = {}
         for number in range(INVERTER_COUNT):
@@ -249,16 +253,17 @@ class E3dcPowerStation(Device):
         if self.grid_control is not None:
             self.grid_control.clear_setpoints()
 
+    def _note_fresh_on_update(self, component: Component, name: str) -> None:
+        """Mark a meter block fresh before any other listener of it runs."""
+        component.add_update_listener(lambda: self._fresh_meter_blocks.add(name))
+
     async def async_poll(
         self, names: Iterable[str], report: UpdateReport | None = None
     ) -> UpdateReport:
-        """Poll ``names`` and note which meter blocks this poll refreshed."""
+        """Poll ``names``, forgetting first which meter blocks were fresh."""
         names = tuple(names)
-        polled = {"power_meters", "wide_power_meters"} & set(names)
-        self._fresh_meter_blocks -= polled
-        report = await super().async_poll(names, report)
-        self._fresh_meter_blocks |= polled & report.updated
-        return report
+        self._fresh_meter_blocks -= {"power_meters", "wide_power_meters"} & set(names)
+        return await super().async_poll(names, report)
 
     async def async_update_readings(self) -> UpdateReport:
         """Refresh what the device measures and reports on its own.
