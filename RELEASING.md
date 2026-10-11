@@ -1,24 +1,28 @@
 # Releasing `e3dc-ess-modbus`
 
-This document describes how to release a new version of `e3dc-ess-modbus` to PyPI.
+Publishing a GitHub release publishes the package to PyPI. Nothing else does.
 
-## Tagging Convention
+## Release tags
 
-> [!IMPORTANT]
-> **Release tags must be bare semantic versions without a leading `v`** (e.g. `0.1.5`, `1.0.0`).
-> Do not use `v`-prefixed tags like `v0.1.5`.
+A release tag is the bare version, such as `0.1.5` or `1.0.0`, without a leading `v`. The workflow sets the package version from it. The `pypi` environment only accepts tags that match `*.*.*`.
 
-Release tags are directly substituted into `pyproject.toml` during the release workflow to set the package version according to PEP 440.
+## Releasing
 
-## Release Process
+1. Check that the `CI` workflow is green on `main`.
+2. On GitHub, draft a new release:
+   - **Tag:** the new version, such as `0.1.5`, created on `main`.
+   - **Title:** the version.
+   - **Description:** the release notes.
+3. Publish the release. This starts the `Publish to PyPI` workflow, which runs the tests, sets the version from the tag, and builds the package.
+4. In the Actions tab, approve the `publish` job. It waits for approval because it runs in the `pypi` environment. Once approved, it publishes to PyPI through trusted publishing.
 
-1. **Verify CI**: Ensure that the `CI` workflow is green on the `main` branch.
-2. **Draft a GitHub Release**:
-   - Go to GitHub Releases: **Draft a new release**.
-   - **Choose a tag**: Enter the new version number as a bare tag (e.g. `0.1.5`).
-   - **Target**: `main`.
-   - **Title**: Enter the version number (e.g. `0.1.5`).
-   - **Description**: Provide release notes / changelog.
-3. **Publish the Release**:
-   - Click **Publish release**.
-   - The `.github/workflows/publish.yml` workflow will automatically trigger, build the wheel and source distribution, and publish the package to PyPI via Trusted Publishing.
+## One-time PyPI setup
+
+On PyPI, the trusted publisher for `e3dc-ess-modbus` must name:
+
+- **Owner:** `AlCalzone`
+- **Repository:** `e3dc-ess-modbus`
+- **Workflow:** `publish.yml`
+- **Environment:** `pypi`
+
+For the first release, add it as a pending publisher, because the project doesn't exist on PyPI yet.

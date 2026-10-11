@@ -3,48 +3,28 @@ name: Publish to PyPI
 on:
   release:
     types: [published]
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: Existing release tag to build and publish (e.g. 0.1.0)
-        required: true
-        type: string
-
-env:
-  RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
 
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
     steps:
-      - name: Check the tag is a version
-        run: |
-          [[ "$RELEASE_TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([ab]|rc)?[0-9]*$ ]]
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          # Only a tag can be published, never a branch or a commit
-          ref: refs/tags/${{ env.RELEASE_TAG }}
           persist-credentials: false
-      - name: Verify the checkout is the release tag
-        run: test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
-          # A cache restored from another run must not feed the release artifact
+          version: "0.11.17"
           enable-cache: false
-      - name: Run the tests
+      - run: uv sync --locked
+      - run: uv run pytest
+      - name: Set the package version from the release tag
         run: |
-          uv sync --locked
-          uv run pytest
-      - name: Set package version from release tag
-        run: |
-          VERSION="${RELEASE_TAG#v}"
-          sed -i "s/^version = \"0\\.0\\.0\"$/version = \"${VERSION}\"/" pyproject.toml
-      - name: Verify the version was substituted
-        run: |
-          VERSION="${RELEASE_TAG#v}"
-          grep -qx "version = \"${VERSION}\"" pyproject.toml
+          uv version --frozen "$RELEASE_TAG"
+          test "$(uv version --short)" = "$RELEASE_TAG"
       - run: uv build
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -53,8 +33,8 @@ jobs:
 
   publish:
     needs: build
-    if: github.ref_type == 'tag' || github.event_name == 'release'
     runs-on: ubuntu-latest
+    # The pypi environment only accepts version tags and needs an approval
     environment: pypi
     permissions:
       id-token: write
