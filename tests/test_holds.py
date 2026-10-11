@@ -2,21 +2,32 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import FrozenInstanceError
 from unittest.mock import AsyncMock
 
 import pytest
-from modbus_connection import IllegalFunctionError, ModbusTimeoutError
+from modbus_connection import (
+    IllegalDataAddressError,
+    IllegalDataValueError,
+    IllegalFunctionError,
+    ModbusTimeoutError,
+)
 from modbus_connection.mock import MockModbusUnit, WriteEvent
 
 from e3dc_ess_modbus import (
+    E3dcError,
     E3dcPowerStation,
+    Hold,
     HoldsClosedError,
     InconsistentWriteError,
+    InvalidValueError,
     NoSetpointError,
     Setpoint,
     SetpointHolds,
 )
 from e3dc_ess_modbus.model import register
+
+from .conftest import seed
 
 BATTERY = Setpoint.BATTERY_POWER
 FEED_IN = Setpoint.FEED_IN_LIMIT
@@ -140,6 +151,8 @@ async def test_a_failing_rewrite_is_flagged_once_and_recovers(
     mock_modbus_unit.fail_write(register(40197), None)
     await holds.async_rewrite()
 
+    hold = holds.get(BATTERY)
+    assert hold is not None
     assert hold.confirmed
     assert "Rewriting battery_power works again" in caplog.text
     assert len(changes) == 3
@@ -360,3 +373,166 @@ async def test_closing_stops_the_built_in_loop(
     await asyncio.sleep(0.05)
 
     assert len(_writes_to(writes, 40192)) == count
+
+
+async def test_holds_skipped_after_a_timeout_count_as_failing(
+    holds: SetpointHolds, mock_modbus_unit: MockModbusUnit
+) -> None:
+    changes: list[None] = []
+    await holds.async_start(ACTIVE, 50)
+    await holds.async_start(BATTERY, 3000)
+    holds._on_change = lambda: changes.append(None)
+    mock_modbus_unit.fail_requests(ModbusTimeoutError())
+
+    for _ in range(4):
+        await holds.async_rewrite()
+
+    for setpoint in (ACTIVE, BATTERY):
+        hold = holds.get(setpoint)
+        assert hold is not None
+        assert hold.failing
+    assert len(changes) == 2
+
+
+async def test_a_refused_setpoint_does_not_stop_the_others(
+    holds: SetpointHolds, mock_modbus_unit: MockModbusUnit, writes: list[WriteEvent]
+) -> None:
+    await holds.async_start(ACTIVE, 50)
+    await holds.async_start(BATTERY, 3000)
+    mock_modbus_unit.fail_write(register(40192), IllegalDataValueError())
+    writes.clear()
+
+    await holds.async_rewrite()
+
+    active, battery = holds.get(ACTIVE), holds.get(BATTERY)
+    assert active is not None
+    assert battery is not None
+    assert active.failing
+    assert battery.confirmed
+    assert _writes_to(writes, 40197) == [[3000, 0]]
+
+
+async def test_the_built_in_loop_survives_a_failing_callback(
+    station: E3dcPowerStation,
+    mock_modbus_unit: MockModbusUnit,
+    writes: list[WriteEvent],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    await station.async_ensure_setup()
+
+    def broken() -> None:
+        raise RuntimeError("listener bug")
+
+    holds = SetpointHolds(station, interval=0.01, on_change=broken)
+    await holds.async_start(BATTERY, 3000)
+    mock_modbus_unit.fail_write(register(40197), ModbusTimeoutError())
+    await asyncio.sleep(0.03)
+    mock_modbus_unit.fail_write(register(40197), None)
+    before = len(_writes_to(writes, 40197))
+    await asyncio.sleep(0.05)
+
+    assert len(_writes_to(writes, 40197)) > before
+    assert "The on_change callback failed" in caplog.text
+    await holds.async_close()
+
+
+async def test_the_built_in_loop_logs_an_unexpected_error(
+    station: E3dcPowerStation,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    await station.async_ensure_setup()
+    holds = SetpointHolds(station, interval=0.01)
+    await holds.async_start(BATTERY, 3000)
+    calls = 0
+
+    async def flaky() -> None:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(holds, "async_rewrite", flaky)
+    await asyncio.sleep(0.05)
+
+    assert calls >= 2
+    assert "A rewrite failed unexpectedly" in caplog.text
+    await holds.async_close()
+
+
+async def test_a_failing_callback_does_not_hide_the_real_error(
+    holds: SetpointHolds, mock_modbus_unit: MockModbusUnit
+) -> None:
+    def broken() -> None:
+        raise RuntimeError("listener bug")
+
+    holds._on_change = broken
+    mock_modbus_unit.fail_write(register(40192), IllegalDataValueError())
+
+    with pytest.raises(IllegalDataValueError):
+        await holds.async_start(ACTIVE, 50)
+
+
+async def test_close_drops_holds_whose_hand_back_timed_out(
+    holds: SetpointHolds,
+    mock_modbus_unit: MockModbusUnit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await holds.async_start(BATTERY, 3000)
+    write_register = mock_modbus_unit.write_register
+
+    async def hang(address: int, value: int) -> None:
+        await asyncio.sleep(10)
+        await write_register(address, value)
+
+    monkeypatch.setattr(mock_modbus_unit, "write_register", hang)
+    await holds.async_close(timeout=0.01)
+
+    assert holds.get(BATTERY) is None
+
+
+async def test_close_bounds_the_wait_for_a_running_rewrite(
+    holds: SetpointHolds,
+    mock_modbus_unit: MockModbusUnit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await holds.async_start(BATTERY, 3000)
+    write_registers = mock_modbus_unit.write_registers
+
+    async def slow(address: int, values: list[int]) -> None:
+        await asyncio.sleep(0.3)
+        await write_registers(address, values)
+
+    monkeypatch.setattr(mock_modbus_unit, "write_registers", slow)
+    rewrite = asyncio.create_task(holds.async_rewrite())
+    await asyncio.sleep(0)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await holds.async_close(timeout=0.05)
+
+    assert loop.time() - started < 0.2
+    await rewrite
+
+
+def test_a_hold_cannot_be_changed_from_outside() -> None:
+    hold = Hold(3000)
+
+    with pytest.raises(FrozenInstanceError):
+        hold.value = 500  # type: ignore[misc]
+
+
+@pytest.mark.parametrize("interval", [0, -1, 25])
+async def test_the_interval_is_checked(
+    station: E3dcPowerStation, interval: float
+) -> None:
+    with pytest.raises(InvalidValueError):
+        SetpointHolds(station, interval=interval)
+
+
+async def test_a_missing_component_raises(mock_modbus_unit: MockModbusUnit) -> None:
+    seed(mock_modbus_unit)
+    mock_modbus_unit.fail_read(register(40199), IllegalDataAddressError())
+    station = await E3dcPowerStation.async_detect(mock_modbus_unit)
+    holds = SetpointHolds(station, interval=None)
+
+    with pytest.raises(E3dcError, match="no battery control"):
+        await holds.async_start(BATTERY, 1000)

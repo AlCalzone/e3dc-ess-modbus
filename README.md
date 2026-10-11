@@ -224,17 +224,17 @@ A mapping of slot number to `Inverter`, with every slot that answers its registe
 
 ### `SetpointHolds(station, *, interval=10.0, on_change=None)`
 
-Keeps setpoints alive against the 30 second watchdog. One lock serializes starting, stopping and rewriting. With `interval=None` it runs no loop of its own, and the caller calls `async_rewrite()` every 10 seconds or less. `on_change` is called whenever a hold changes.
+Keeps setpoints alive against the 30 second watchdog. One lock serializes starting, stopping and rewriting. With `interval=None` it runs no loop of its own, and the caller calls `async_rewrite()` every 10 seconds or less. An interval must be above 0 and at most 20 seconds. If the active power failsafe timeout (40194) is shorter than the interval, the active power limit lapses between rewrites. `on_change` is called whenever a hold changes, and an exception it raises is logged.
 
 - `Setpoint`: `BATTERY_POWER` (W), `FEED_IN_LIMIT` (W), `ACTIVE_POWER_LIMIT` (%).
-- `get(setpoint)`: the `Hold`, with `value`, `failing` (the last rewrite failed), `releasing` (a hand-back failed and is retried) and `confirmed` (neither), or `None`.
+- `get(setpoint)`: the `Hold`, a frozen snapshot with `value`, `failing` (the last rewrite failed), `releasing` (a hand-back failed and is retried) and `confirmed` (neither), or `None`.
 - `requested(setpoint)`: the last value written or remembered, held or not.
 - `remember(setpoint, value)`: remember a value for `async_resume` without writing it.
-- `await async_start(setpoint, value)`: write a value and hold it. A failed write keeps the current hold, except a half-written one, which ends it.
+- `await async_start(setpoint, value)`: write a value and hold it. A failed write keeps the current hold, except a half-written one, which ends it. Raises `E3dcError` if the firmware lacks the setpoint's registers.
 - `await async_resume(setpoint)`: hold the last requested value again.
 - `await async_stop(setpoint)`: hand control back. The battery leaves remote control, the active power limit goes to 100 %, and the feed-in limit lapses within 30 seconds. A failed hand-back stays as releasing and is retried on each rewrite. A failed battery hand-back is dropped after 30 seconds, when the watchdog has dropped the setpoint anyway.
-- `await async_rewrite()`: write every hold again. The first transport error ends the pass.
-- `await async_close(timeout=5.0)`: hand everything back within `timeout`, and refuse new holds.
+- `await async_rewrite()`: write every hold again. A device refusing one setpoint doesn't stop the others. A connection error or timeout ends the pass, and the setpoints it skipped count as failing.
+- `await async_close(timeout=5.0)`: hand everything back and refuse new holds. Waiting for a running rewrite and the hand-backs take at most `timeout` together. Afterwards nothing is held, even if a hand-back failed.
 
 ### Enums
 
@@ -252,6 +252,7 @@ All errors the library raises itself derive from `E3dcError`. Transport and devi
 - `InvalidValueError`: a value to write is out of range or of the wrong type. It is also a `ValueError`. Nothing is written.
 - `InconsistentWriteError`: on a device that refuses FC16, a two-register setpoint failed after its first half may have landed. The library has written 1 to 40199 for the battery power, or the last feed-in limit for the feed-in limit, and forgotten the setpoint.
 - `HoldsClosedError`: `SetpointHolds` was closed.
+- `E3dcError` itself: `SetpointHolds` was asked to hold a setpoint the firmware has no registers for.
 - `NoSetpointError`: `async_resume` has no value to hold.
 - `ModbusConnectionError`: the connection was lost.
 - `ModbusTimeoutError`: the device didn't answer before any component had refreshed.

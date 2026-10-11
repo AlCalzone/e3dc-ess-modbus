@@ -13,16 +13,17 @@ import contextlib
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from modbus_connection import ModbusError
+from modbus_connection import ModbusConnectionError, ModbusError, ModbusTimeoutError
 
 from .errors import (
     E3dcError,
     HoldsClosedError,
     InconsistentWriteError,
+    InvalidValueError,
     NoSetpointError,
 )
 
@@ -34,6 +35,8 @@ _LOGGER = logging.getLogger(__name__)
 
 REWRITE_INTERVAL = 10.0
 """Seconds between rewrites, well inside the 30 second watchdog."""
+MAX_INTERVAL = 20.0
+"""The longest interval that still leaves room for one failed rewrite."""
 BATTERY_RELEASE_TIMEOUT = 30.0
 """Seconds after which a failed battery hand-back is moot: 40197 has lapsed."""
 CLOSE_TIMEOUT = 5.0
@@ -48,7 +51,7 @@ class Setpoint(StrEnum):
     ACTIVE_POWER_LIMIT = "active_power_limit"
 
 
-@dataclass
+@dataclass(frozen=True)
 class Hold:
     """A setpoint being written again, or still being handed back."""
 
@@ -122,7 +125,14 @@ class SetpointHolds:
         interval: float | None = REWRITE_INTERVAL,
         on_change: Callable[[], None] | None = None,
     ) -> None:
-        """Initialize the holds."""
+        """Initialize the holds.
+
+        Raises ``InvalidValueError`` for an interval outside 0 to 20 seconds.
+        """
+        if interval is not None and not 0 < interval <= MAX_INTERVAL:
+            raise InvalidValueError(
+                f"interval {interval} s is outside 0 to {MAX_INTERVAL} s"
+            )
         self._station = station
         self._interval = interval
         self._on_change = on_change
@@ -147,10 +157,11 @@ class SetpointHolds:
     async def async_start(self, setpoint: Setpoint, value: float) -> None:
         """Write ``value`` now and keep writing it until stopped.
 
-        Raises ``HoldsClosedError`` after ``async_close``, and whatever the
-        write raises: ``InvalidValueError``, ``InconsistentWriteError`` or a
-        ``ModbusError``. A failed write leaves the current hold as it was,
-        except a half-written one, which ends it.
+        Raises ``HoldsClosedError`` after ``async_close``, and ``E3dcError``
+        when the firmware lacks the setpoint's registers. Otherwise it raises
+        whatever the write raises: ``InvalidValueError``,
+        ``InconsistentWriteError`` or a ``ModbusError``. A failed write leaves
+        the current hold as it was, except a half-written one, which ends it.
         """
         try:
             async with self._lock:
@@ -189,47 +200,78 @@ class SetpointHolds:
             self._changed()
 
     async def async_close(self, timeout: float = CLOSE_TIMEOUT) -> None:
-        """Hand every setpoint back within ``timeout`` and take no new ones."""
-        async with self._lock:
-            self._closed = True
-            if self._loop is not None:
-                self._loop.cancel()
-            try:
-                async with asyncio.timeout(timeout):
-                    for setpoint in list(self._holds):
-                        try:
-                            await self._async_release(setpoint)
-                        except (ModbusError, E3dcError) as err:
-                            _LOGGER.warning("Could not release %s: %s", setpoint, err)
-            except TimeoutError:
-                _LOGGER.warning("Gave up handing setpoints back after %s s", timeout)
+        """Hand every setpoint back and take no new ones.
+
+        Waiting for a running rewrite and the hand-backs together take at most
+        ``timeout``. Afterwards nothing is held, whether the hand-backs
+        succeeded or not, because nothing would retry them.
+        """
         if self._loop is not None:
-            await asyncio.gather(self._loop, return_exceptions=True)
+            self._loop.cancel()
+        try:
+            async with asyncio.timeout(timeout), self._lock:
+                self._closed = True
+                for setpoint in list(self._holds):
+                    try:
+                        await self._async_release(setpoint)
+                    except (ModbusError, E3dcError) as err:
+                        _LOGGER.warning("Could not release %s: %s", setpoint, err)
+        except TimeoutError:
+            _LOGGER.warning("Gave up handing setpoints back after %s s", timeout)
+        self._closed = True
+        self._holds.clear()
+        if self._loop is not None:
+            (result,) = await asyncio.gather(self._loop, return_exceptions=True)
+            if isinstance(result, Exception):
+                _LOGGER.error("The rewrite loop had failed: %r", result)
         self._changed()
 
     async def async_rewrite(self) -> None:
         """Write every held setpoint again, and retry failed hand-backs.
 
-        The first transport error ends the pass, so a dead link doesn't keep
-        the lock for a timeout per setpoint.
+        A device refusing one setpoint doesn't stop the others. A connection
+        error or a timeout ends the pass, so a dead link doesn't keep the lock
+        for a timeout per setpoint. The setpoints it skipped count as failing.
         """
         changed = False
         async with self._lock:
             if self._closed:
                 return
-            for setpoint, hold in list(self._holds.items()):
+            pending = list(self._holds)
+            while pending:
+                setpoint = pending.pop(0)
+                hold = self._holds[setpoint]
                 try:
                     if hold.releasing:
                         changed |= await self._async_retry_release(setpoint, hold)
                     else:
                         changed |= await self._async_rewrite_one(setpoint, hold)
-                except ModbusError:
+                except (ModbusConnectionError, ModbusTimeoutError):
+                    for skipped in pending:
+                        changed |= self._mark_failing(skipped, None)
                     break
+                except ModbusError:
+                    continue
         if changed:
             self._changed()
 
+    def _mark_failing(self, setpoint: Setpoint, err: ModbusError | None) -> bool:
+        """Mark a held setpoint failing; return whether that changed it."""
+        hold = self._holds[setpoint]
+        if hold.failing or hold.releasing:
+            return False
+        self._holds[setpoint] = replace(hold, failing=True)
+        if err is None:
+            _LOGGER.warning("Could not rewrite %s: the link is down", setpoint)
+        else:
+            _LOGGER.warning("Could not rewrite %s: %s", setpoint, err)
+        return True
+
     async def _async_rewrite_one(self, setpoint: Setpoint, hold: Hold) -> bool:
-        """Rewrite one hold; return whether its state changed."""
+        """Rewrite one hold; return whether its state changed.
+
+        A ``ModbusError`` marks the hold failing and is raised on.
+        """
         try:
             await _WRITE[setpoint](self._station, hold.value)
         except InconsistentWriteError as err:
@@ -239,13 +281,11 @@ class SetpointHolds:
             self._holds.pop(setpoint, None)
             return True
         except ModbusError as err:
-            if not hold.failing:
-                hold.failing = True
-                _LOGGER.warning("Could not rewrite %s: %s", setpoint, err)
+            if self._mark_failing(setpoint, err):
                 self._changed()
             raise
         if hold.failing:
-            hold.failing = False
+            self._holds[setpoint] = replace(hold, failing=False)
             _LOGGER.info("Rewriting %s works again", setpoint)
             return True
         return False
@@ -262,7 +302,7 @@ class SetpointHolds:
             )
             self._holds.pop(setpoint, None)
             return True
-        with contextlib.suppress(E3dcError):
+        with contextlib.suppress(InconsistentWriteError):
             await self._async_release(setpoint)
             _LOGGER.info("Released %s after an earlier failure", setpoint)
             return True
@@ -277,7 +317,9 @@ class SetpointHolds:
                 await release(self._station)
             except (ModbusError, InconsistentWriteError):
                 if hold.releasing_since is None:
-                    hold.releasing_since = time.monotonic()
+                    self._holds[setpoint] = replace(
+                        hold, releasing_since=time.monotonic()
+                    )
                 raise
         self._holds.pop(setpoint, None)
 
@@ -290,8 +332,15 @@ class SetpointHolds:
         """Rewrite every ``interval`` seconds while anything is held."""
         while self._holds and not self._closed:
             await asyncio.sleep(interval)
-            await self.async_rewrite()
+            try:
+                await self.async_rewrite()
+            except Exception:
+                _LOGGER.exception("A rewrite failed unexpectedly")
 
     def _changed(self) -> None:
-        if self._on_change is not None:
+        if self._on_change is None:
+            return
+        try:
             self._on_change()
+        except Exception:
+            _LOGGER.exception("The on_change callback failed")
