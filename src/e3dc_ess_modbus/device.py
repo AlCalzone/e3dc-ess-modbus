@@ -8,7 +8,12 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Self
 
-from modbus_connection import IllegalDataAddressError, IllegalFunctionError
+from modbus_connection import (
+    IllegalDataAddressError,
+    IllegalFunctionError,
+    ModbusExceptionError,
+    ModbusTimeoutError,
+)
 from modbus_connection.model import Component, Device, Raw, read_optional
 
 from .control import (
@@ -92,8 +97,9 @@ class E3dcPowerStation(Device):
         self.inverters: Inverters | None = None
 
         self._setup_lock = asyncio.Lock()
-        self._wide_meters_fresh = False
+        self._fresh_meter_blocks: set[str] = set()
         self._control_state = ControlState()
+        unit.on_connection_lost(self._forget_setpoints)
 
     @classmethod
     async def async_detect(
@@ -133,12 +139,14 @@ class E3dcPowerStation(Device):
         """All eight meter slots, keyed by slot.
 
         The 32-bit phase powers win only when they refreshed in the last poll
-        that read them.
+        that read them. The 16-bit values and the meter types are from the
+        last poll the 16-bit block answered.
         """
+        wide_fresh = "wide_power_meters" in self._fresh_meter_blocks
         readings: dict[int, PowerMeterReading] = {}
         for number, narrow in enumerate(self.power_meters.meters):
             powers = (narrow.power_l1, narrow.power_l2, narrow.power_l3)
-            if self.wide_power_meters is not None and self._wide_meters_fresh:
+            if self.wide_power_meters is not None and wide_fresh:
                 wide = self.wide_power_meters.meters[number]
                 wide_powers = (wide.power_l1, wide.power_l2, wide.power_l3)
                 if None not in wide_powers:
@@ -160,7 +168,8 @@ class E3dcPowerStation(Device):
 
         unit = self.modbus_unit
         self.wide_power_meters = await self._async_probe(WidePowerMeters(unit))
-        self._wide_meters_fresh = self.wide_power_meters is not None
+        if self.wide_power_meters is not None:
+            self._fresh_meter_blocks.add("wide_power_meters")
         self.grid_status = await self._async_probe(GridStatus(unit))
         self.grid_control = await self._async_probe(GridControl(unit))
         self.battery_control = await self._async_probe(BatteryControl(unit))
@@ -207,31 +216,48 @@ class E3dcPowerStation(Device):
         """Keep every inverter slot that answers its block.
 
         A slot without an inverter may answer with zeros. ``is_connected``
-        tells the two apart once the inverter reports a grid voltage.
+        tells the two apart once the inverter reports a grid voltage. Once
+        slot 0 has answered, any refusal or timeout of an additional slot
+        means that slot is absent.
         """
         found: dict[int, Inverter] = {}
         for number in range(INVERTER_COUNT):
             inverter = Inverter(self.modbus_unit, base_offset=number * INVERTER_STRIDE)
-            if await read_optional(inverter) is None:
+            absent: tuple[type[Exception], ...] = (
+                (IllegalDataAddressError, IllegalFunctionError)
+                if not found
+                else (ModbusExceptionError, ModbusTimeoutError)
+            )
+            try:
+                await inverter.async_update()
+            except absent as err:
                 _LOGGER.info(
-                    "Power station %s refuses inverter slot %d (registers %d-%d)",
+                    "Power station %s refuses inverter slot %d (registers %d-%d): %s",
                     self.serial_number,
                     number,
                     41000 + number * INVERTER_STRIDE,
                     41000 + number * INVERTER_STRIDE + INVERTER_STRIDE - 1,
+                    err,
                 )
                 continue
             found[number] = inverter
         self.inverters = Inverters(self.modbus_unit, found) if found else None
 
-    async def _async_poll(self, names: tuple[str, ...]) -> UpdateReport:
-        """Poll ``names`` and note whether the 32-bit meter values are current."""
-        await self.async_ensure_setup()
-        if "wide_power_meters" in names:
-            self._wide_meters_fresh = False
-        report = await self.async_poll(names)
-        if "wide_power_meters" in names:
-            self._wide_meters_fresh = "wide_power_meters" in report.updated
+    def _forget_setpoints(self) -> None:
+        """Forget every setpoint, because the device may have dropped them."""
+        self._control_state.clear_battery()
+        if self.grid_control is not None:
+            self.grid_control.clear_setpoints()
+
+    async def async_poll(
+        self, names: Iterable[str], report: UpdateReport | None = None
+    ) -> UpdateReport:
+        """Poll ``names`` and note which meter blocks this poll refreshed."""
+        names = tuple(names)
+        polled = {"power_meters", "wide_power_meters"} & set(names)
+        self._fresh_meter_blocks -= polled
+        report = await super().async_poll(names, report)
+        self._fresh_meter_blocks |= polled & report.updated
         return report
 
     async def async_update_readings(self) -> UpdateReport:
@@ -240,18 +266,21 @@ class E3dcPowerStation(Device):
         That is the power flows, DC strings, wallboxes, power meters, the power
         output and inverter mode status, the battery limits and the inverters.
         """
-        return await self._async_poll(READINGS)
+        await self.async_ensure_setup()
+        return await self.async_poll(READINGS)
 
     async def async_update_settings(self) -> UpdateReport:
         """Refresh the feed-in limit, the failsafe timeouts and the 40199 flag.
 
         These change only when something writes them.
         """
-        return await self._async_poll(SETTINGS)
+        await self.async_ensure_setup()
+        return await self.async_poll(SETTINGS)
 
     async def async_update(self) -> UpdateReport:
         """Refresh readings and settings together in one report."""
-        return await self._async_poll((*READINGS, *SETTINGS))
+        await self.async_ensure_setup()
+        return await self.async_poll((*READINGS, *SETTINGS))
 
     async def async_read_raw(self, names: Iterable[str] | None = None) -> Raw:
         """Every register this device reads, undecoded, for diagnostics."""

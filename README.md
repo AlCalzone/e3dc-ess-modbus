@@ -55,9 +55,9 @@ Every value is `None` until the first update. Each update returns an `UpdateRepo
 - **Request rate:** the device accepts at most 10 requests per second. The library spaces its requests by 100 ms to stay under that.
 - **Optional components:** setup probes which components the firmware serves and logs the missing ones at `INFO`. Those it doesn't serve stay `None`.
 - **Setpoints expire:** the feed-in limit and the battery power lapse 30 seconds after the last write. The active power limit and the reactive power setpoints hold for the failsafe timeouts, 30 seconds by default. A timeout of 0 keeps them until the next write.
-- **Holding a setpoint:** the library writes a setpoint once and never repeats it. To hold one, write it again before its timeout runs out. The `*_setpoint` attributes keep the last value the device acknowledged. They don't clear when the setpoint lapses.
+- **Holding a setpoint:** the library writes a setpoint once and never repeats it. To hold one, write it again before its timeout runs out. The `*_setpoint` attributes keep the last value written that the device acknowledged, as encoded. They don't clear when the setpoint lapses, only when the connection drops.
 - **Reading back a write:** a write doesn't refresh the cached values. Call `await async_update_settings()` to read back what took effect.
-- **Two-register writes:** the feed-in limit and the battery power go out as one FC16 write. If the device refuses FC16, the library logs it once and sends two single-register writes from then on. Between those two writes, the register pair holds a value that is neither the old nor the new one.
+- **Two-register writes:** the feed-in limit and the battery power go out as one FC16 write. If the device refuses FC16, the library logs it once and sends two single-register writes from then on. Between those two writes, the register pair holds a value that is neither the old nor the new one. If the second write fails, the library ends remote battery control, or writes the old feed-in limit back, and raises `InconsistentWriteError`.
 - **Feed-in limit:** `feed_in_limit` reads back the last value written. The limit in effect may differ.
 - **Wallbox bits:** which bits a wallbox uses depends on its model. Unused bits stay unset.
 - **Testing:** built against the vendor's Modbus TCP manual, version 2.80, and tested against modbus-connection's mock. It has not been tested on real hardware.
@@ -139,7 +139,7 @@ Each `Wallbox` has:
 
 A `PowerMeterReading` has:
 
-- `meter_type`: a `PowerMeterType`.
+- `meter_type`: a `PowerMeterType`, or `None` for an empty slot.
 - `is_installed`: a meter is configured in this slot.
 - `power_l1`, `power_l2`, `power_l3`: power per phase, in W.
 
@@ -192,7 +192,7 @@ Optional. Present on firmware 2025_43 or later.
 
 - `inverter_mode_request`: the forced inverter mode, an `InverterModeRequest`.
 - `inverter_mode`: the inverter mode in effect, an `InverterMode`.
-- `await async_write_inverter_mode(mode)`: force an `InverterModeRequest`.
+- `await async_write_inverter_mode_request(mode)`: force an `InverterModeRequest`.
 
 ### `battery_limits` (`BatteryLimits`)
 
@@ -236,7 +236,7 @@ All errors the library raises itself derive from `E3dcError`. Transport and devi
 
 - `NotAnE3dcError`: the device refused the identity block, or didn't identify as an E3/DC power station in E3DC mode. Raised by `async_detect()` and the first update.
 - `InvalidValueError`: a value to write is out of range or of the wrong type. It is also a `ValueError`. Nothing is written.
-- `InconsistentWriteError`: on a device that refuses FC16, the first half of a two-register setpoint was written and the second failed. The setpoint is forgotten.
+- `InconsistentWriteError`: on a device that refuses FC16, the first half of a two-register setpoint was written and the second failed. The library has tried to restore a safe state and forgotten the setpoint.
 - `ModbusConnectionError`: the connection was lost.
 - `ModbusTimeoutError`: the device didn't answer before any component had refreshed.
 - `ModbusExceptionError`: the device refused a write, for example a setpoint on firmware that doesn't support it.

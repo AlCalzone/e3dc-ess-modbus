@@ -9,6 +9,7 @@ from modbus_connection import (
     IllegalDataValueError,
     ModbusConnectionError,
     ModbusTimeoutError,
+    ServerDeviceFailureError,
 )
 from modbus_connection.mock import MockModbusUnit
 
@@ -505,3 +506,44 @@ async def test_a_failed_wallbox_write_names_the_slot(
         await station.wallboxes.slots[0].async_write_schuko_on(True)
 
     assert "writing schuko_on of wallbox 0" in err.value.__notes__
+
+
+@pytest.mark.parametrize(
+    "error",
+    [ServerDeviceFailureError(), ModbusTimeoutError()],
+    ids=["exception_code_4", "timeout"],
+)
+async def test_an_additional_slot_failing_otherwise_is_absent(
+    mock_modbus_unit: MockModbusUnit, error: Exception
+) -> None:
+    seed(mock_modbus_unit)
+    mock_modbus_unit.fail_read(register(41000 + 34), error)
+    station = E3dcPowerStation(mock_modbus_unit)
+    report = await station.async_update_readings()
+
+    assert 1 not in _inverters(station)
+    assert report.complete
+
+
+async def test_slot_0_timing_out_fails_setup(mock_modbus_unit: MockModbusUnit) -> None:
+    seed(mock_modbus_unit)
+    mock_modbus_unit.fail_read(register(41000), ModbusTimeoutError())
+    station = E3dcPowerStation(mock_modbus_unit)
+
+    with pytest.raises(ModbusTimeoutError):
+        await station.async_update_readings()
+
+
+async def test_public_polls_track_meter_freshness(
+    station: E3dcPowerStation, mock_modbus_unit: MockModbusUnit
+) -> None:
+    await station.async_update_readings()
+    mock_modbus_unit.fail_read(register(40137), IllegalDataAddressError())
+
+    await station.async_poll(["wide_power_meters"])
+
+    assert station.power_meter_readings[0].power_l1 == -200
+
+
+def test_an_empty_meter_slot_has_no_type(station: E3dcPowerStation) -> None:
+    assert station.power_meter_readings[2].meter_type is None

@@ -11,16 +11,18 @@ and the setpoint then holds until it is written again.
 
 The library writes a setpoint once. A caller that wants it to hold writes it
 again before its timeout runs out. A ``*_setpoint`` attribute holds the last
-value the device acknowledged. It is not cleared when the setpoint lapses.
+value written that the device acknowledged. It is not cleared when the
+setpoint lapses, only when the connection drops.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from modbus_connection import IllegalFunctionError, ModbusError
+from modbus_connection import IllegalDataAddressError, IllegalFunctionError, ModbusError
 from modbus_connection.encode import encode_int
 from modbus_connection.model import boolean, enum, int32, integer
 
@@ -76,12 +78,12 @@ def _int(value: Any, low: int, high: int, what: str) -> int:
     return value
 
 
-def _percent(value: Any, low: float, high: float) -> float:
+def _percent(value: Any, low: float, high: float, what: str) -> float:
     """Check that ``value`` is a number from ``low`` to ``high``."""
     if isinstance(value, bool) or not isinstance(value, int | float):
-        raise InvalidValueError(f"{value!r} is not a number")
+        raise InvalidValueError(f"{what} {value!r} is not a number")
     if not low <= value <= high:
-        raise InvalidValueError(f"{value} % is outside {low} to {high}")
+        raise InvalidValueError(f"{what} {value} % is outside {low} to {high}")
     return value
 
 
@@ -91,13 +93,15 @@ def _timeout(value: Any) -> int:
 
 def _flag(value: Any) -> bool:
     if not isinstance(value, bool):
-        raise InvalidValueError(f"{value!r} is not a bool")
+        raise InvalidValueError(f"remote_control_disabled {value!r} is not a bool")
     return value
 
 
 def _mode_request(value: Any) -> InverterModeRequest:
     if not isinstance(value, InverterModeRequest):
-        raise InvalidValueError(f"{value!r} is not an InverterModeRequest")
+        raise InvalidValueError(
+            f"inverter_mode_request {value!r} is not an InverterModeRequest"
+        )
     return value
 
 
@@ -107,28 +111,33 @@ def _word(value: int) -> int:
 
 
 async def _write_tenths(
-    unit: ModbusUnit, index: int, percent: Any, low: float, high: float
+    unit: ModbusUnit, index: int, percent: Any, low: float, high: float, what: str
 ) -> float:
-    """Write a percentage to register ``index`` in the device's 0.1 % steps."""
-    checked = _percent(percent, low, high)
-    await unit.write_register(register(index), _word(round(checked * 10)))
-    return checked
+    """Write a percentage to register ``index`` and return the value it encodes."""
+    tenths = round(_percent(percent, low, high, what) * 10)
+    await unit.write_register(register(index), _word(tenths))
+    return tenths / 10
 
 
 async def _write_int32(
-    unit: ModbusUnit, state: ControlState, index: int, value: int
+    unit: ModbusUnit,
+    state: ControlState,
+    index: int,
+    value: int,
+    restore: Callable[[], Awaitable[None]],
 ) -> None:
     """Write a checked signed 32-bit value to register ``index`` and the next one.
 
     The manual lists no FC16 for this device, but one FC16 write is the only
     way to change both words at once. A device that refuses FC16 gets two FC06
-    writes, low word first, for the rest of the session.
+    writes, low word first, for the rest of the session. If the second write
+    fails, ``restore`` puts the device back into a safe state before this raises.
     """
     low, high = encode_int(value, count=2, word_order="little")
     if not state.fc16_refused:
         try:
             await unit.write_registers(register(index), [low, high])
-        except IllegalFunctionError:
+        except (IllegalFunctionError, IllegalDataAddressError):
             _LOGGER.warning(
                 "The power station refuses FC16, so two-register setpoints now "
                 "take two single-register writes"
@@ -146,6 +155,10 @@ async def _write_int32(
             index,
             index + 1,
         )
+        try:
+            await restore()
+        except ModbusError as restore_err:
+            _LOGGER.warning("Restoring a safe state failed too: %s", restore_err)
         raise InconsistentWriteError(
             f"registers {index} and {index + 1} hold half of {value}"
         ) from err
@@ -191,6 +204,13 @@ class GridControl(E3dcComponent):
         self.reactive_power_failsafe_setpoint: float | None = None
         """The last reactive power failsafe acknowledged, in %."""
 
+    def clear_setpoints(self) -> None:
+        """Forget every setpoint, for example after the connection dropped."""
+        self._set_reactive(None, None, None)
+        self.active_power_limit_setpoint = None
+        self.active_power_failsafe_setpoint = None
+        self.reactive_power_failsafe_setpoint = None
+
     def _set_reactive(
         self, var: int | None, cos_phi: int | None, percent: float | None
     ) -> None:
@@ -200,9 +220,20 @@ class GridControl(E3dcComponent):
         self.reactive_power_percent_setpoint = percent
 
     async def async_write_feed_in_limit(self, watts: int) -> None:
-        """Cap the power fed into the grid; rewrite within 30 seconds to keep it."""
-        checked = _int(watts, 0, INT32_MAX, "feed-in limit")
-        await _write_int32(self._unit, self.state, FEED_IN_LIMIT, checked)
+        """Cap the power fed into the grid; rewrite within 30 seconds to keep it.
+
+        If only the low word lands, the old low word is written back. The pair
+        then holds the old limit, which this read last.
+        """
+        checked = _int(watts, 0, INT32_MAX, "feed_in_limit")
+        previous = self.feed_in_limit
+
+        async def restore() -> None:
+            if previous is not None:
+                old_low = encode_int(previous, count=2, word_order="little")[0]
+                await self._unit.write_register(register(FEED_IN_LIMIT), old_low)
+
+        await _write_int32(self._unit, self.state, FEED_IN_LIMIT, checked, restore)
 
     async def async_write_reactive_power(self, var: int) -> None:
         """Set the reactive power, in var.
@@ -210,39 +241,59 @@ class GridControl(E3dcComponent):
         The manual allows ±50 % of the rated apparent power, which the device
         enforces. This checks only that the value fits the register.
         """
-        checked = _int(var, INT16_MIN, INT16_MAX, "reactive power")
+        checked = _int(var, INT16_MIN, INT16_MAX, "reactive_power")
         await self._unit.write_register(register(REACTIVE_POWER), _word(checked))
         self._set_reactive(checked, None, None)
 
     async def async_write_cos_phi(self, value: int) -> None:
         """Set the reactive power as cos φ, from -600 (0.4 capacitive) to 600."""
-        checked = _int(value, COS_PHI_MIN, COS_PHI_MAX, "cos φ setpoint")
+        checked = _int(value, COS_PHI_MIN, COS_PHI_MAX, "cos_phi")
         await self._unit.write_register(register(COS_PHI), _word(checked))
         self._set_reactive(None, checked, None)
 
     async def async_write_reactive_power_percent(self, percent: float) -> None:
         """Set the reactive power as a percentage of the rated apparent power."""
         checked = await _write_tenths(
-            self._unit, REACTIVE_POWER_PERCENT, percent, PERCENT_MIN, PERCENT_MAX
+            self._unit,
+            REACTIVE_POWER_PERCENT,
+            percent,
+            PERCENT_MIN,
+            PERCENT_MAX,
+            "reactive_power_percent",
         )
         self._set_reactive(None, None, checked)
 
     async def async_write_active_power_limit(self, percent: float) -> None:
         """Cap the inverter's active power, ignoring the house's consumption."""
         self.active_power_limit_setpoint = await _write_tenths(
-            self._unit, ACTIVE_POWER_LIMIT, percent, 0, PERCENT_MAX
+            self._unit,
+            ACTIVE_POWER_LIMIT,
+            percent,
+            0,
+            PERCENT_MAX,
+            "active_power_limit",
         )
 
     async def async_write_active_power_failsafe(self, percent: float) -> None:
         """Set the active power limit that applies once a setpoint times out."""
         self.active_power_failsafe_setpoint = await _write_tenths(
-            self._unit, ACTIVE_POWER_FAILSAFE, percent, 0, PERCENT_MAX
+            self._unit,
+            ACTIVE_POWER_FAILSAFE,
+            percent,
+            0,
+            PERCENT_MAX,
+            "active_power_failsafe",
         )
 
     async def async_write_reactive_power_failsafe(self, percent: float) -> None:
         """Set the reactive power that applies once a setpoint times out."""
         self.reactive_power_failsafe_setpoint = await _write_tenths(
-            self._unit, REACTIVE_POWER_FAILSAFE, percent, 0, PERCENT_MAX
+            self._unit,
+            REACTIVE_POWER_FAILSAFE,
+            percent,
+            0,
+            PERCENT_MAX,
+            "reactive_power_failsafe",
         )
 
     async def async_write_active_power_failsafe_timeout(self, seconds: int) -> None:
@@ -288,10 +339,15 @@ class BatteryControl(E3dcComponent):
 
         PV power charges first and the grid makes up the rest. The device
         returns to normal control unless this is rewritten within 30 seconds.
+        If only the low word lands, writing 1 to 40199 ends remote control.
         """
-        checked = _int(watts, INT32_MIN, INT32_MAX, "battery power")
+        checked = _int(watts, INT32_MIN, INT32_MAX, "battery_power")
+
+        async def restore() -> None:
+            await self.write("remote_control_disabled", True)
+
         try:
-            await _write_int32(self._unit, self.state, BATTERY_POWER, checked)
+            await _write_int32(self._unit, self.state, BATTERY_POWER, checked, restore)
         except InconsistentWriteError:
             self.state.clear_battery()
             raise
@@ -322,7 +378,9 @@ class InverterModeControl(E3dcComponent):
     inverter_mode = enum(register(40201), InverterMode, signed=True)
     """The mode in effect, which the device changes on its own."""
 
-    async def async_write_inverter_mode(self, mode: InverterModeRequest) -> None:
+    async def async_write_inverter_mode_request(
+        self, mode: InverterModeRequest
+    ) -> None:
         """Force an inverter operating mode, or hand control back."""
         await self.write("inverter_mode_request", mode)
 
@@ -357,7 +415,12 @@ class BatteryLimits(E3dcComponent):
         writes one signed 16-bit register.
         """
         checked = await _write_tenths(
-            self._unit, BATTERY_POWER_PERCENT, percent, PERCENT_MIN, PERCENT_MAX
+            self._unit,
+            BATTERY_POWER_PERCENT,
+            percent,
+            PERCENT_MIN,
+            PERCENT_MAX,
+            "battery_power_percent",
         )
         self.state.clear_battery()
         self.state.battery_power_percent = checked
