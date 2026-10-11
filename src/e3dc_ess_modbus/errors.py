@@ -35,3 +35,11 @@ class InconsistentWriteError(E3dcError):
     the last limit written or read went back to 40186 and 40187. The cause
     is chained.
     """
+
+
+class HoldsClosedError(E3dcError):
+    """The setpoint holds were closed and take no new setpoints."""
+
+
+class NoSetpointError(E3dcError):
+    """There is no requested value to hold yet."""

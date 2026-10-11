@@ -15,7 +15,15 @@ from .enums import (
     InverterModeRequest,
     PowerMeterType,
 )
-from .errors import E3dcError, InconsistentWriteError, InvalidValueError, NotAnE3dcError
+from .errors import (
+    E3dcError,
+    HoldsClosedError,
+    InconsistentWriteError,
+    InvalidValueError,
+    NoSetpointError,
+    NotAnE3dcError,
+)
+from .holds import Hold, Setpoint, SetpointHolds
 from .identity import Identity
 from .inverter import Inverter, Inverters
 from .meters import PowerMeter, PowerMeterPhases, PowerMeters, WidePowerMeters
@@ -34,6 +42,8 @@ __all__ = [
     "EmsStatus",
     "GridControl",
     "GridStatus",
+    "Hold",
+    "HoldsClosedError",
     "Identity",
     "InconsistentWriteError",
     "InvalidValueError",
@@ -42,6 +52,7 @@ __all__ = [
     "InverterModeControl",
     "InverterModeRequest",
     "Inverters",
+    "NoSetpointError",
     "NotAnE3dcError",
     "PowerFlows",
     "PowerMeter",
@@ -49,6 +60,8 @@ __all__ = [
     "PowerMeterReading",
     "PowerMeterType",
     "PowerMeters",
+    "Setpoint",
+    "SetpointHolds",
     "UpdateReport",
     "Wallbox",
     "Wallboxes",
