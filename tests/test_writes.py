@@ -205,7 +205,7 @@ REJECTED = [
         lambda station, value: (
             station.inverter_mode_control.async_write_inverter_mode_request(value)
         ),
-        InverterMode.INIT,
+        InverterMode.NORMAL,
         id="inverter_mode_other_enum",
     ),
     pytest.param(_grid("async_write_feed_in_limit"), -1, id="feed_in_negative"),
