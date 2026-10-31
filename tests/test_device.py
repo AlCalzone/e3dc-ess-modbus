@@ -212,6 +212,20 @@ async def test_battery_limits(station: E3dcPowerStation) -> None:
     assert limits.full_charge_energy == 10500
 
 
+async def test_zeroed_battery_limits_are_not_polled(
+    mock_modbus_unit: MockModbusUnit,
+) -> None:
+    # Seen on an E3/DC one with firmware H20_2026_44
+    seed(mock_modbus_unit)
+    seed(mock_modbus_unit, {40202: [1, 0], 40204: [0, 0], 40206: [0, 0], 40208: [0, 0]})
+    station = E3dcPowerStation(mock_modbus_unit)
+    report = await station.async_update()
+
+    assert report.complete
+    assert station.battery_limits is None
+    assert "battery_limits" not in station.readings_components
+
+
 async def test_settings(station: E3dcPowerStation) -> None:
     report = await station.async_update_settings()
 
