@@ -12,10 +12,10 @@ import asyncio
 import contextlib
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, assert_never
 
 from modbus_connection import ModbusConnectionError, ModbusError, ModbusTimeoutError
 
@@ -84,29 +84,32 @@ def _battery(station: E3dcPowerStation) -> BatteryControl:
     return station.battery_control
 
 
-_WRITE: dict[Setpoint, Callable[[E3dcPowerStation, float], Awaitable[None]]] = {
-    Setpoint.BATTERY_POWER: lambda station, value: _battery(
-        station
-    ).async_write_battery_power(int(value)),
-    Setpoint.FEED_IN_LIMIT: lambda station, value: _grid(
-        station
-    ).async_write_feed_in_limit(int(value)),
-    Setpoint.ACTIVE_POWER_LIMIT: lambda station, value: _grid(
-        station
-    ).async_write_active_power_limit(value),
-}
+async def _async_write(
+    station: E3dcPowerStation, setpoint: Setpoint, value: float
+) -> None:
+    match setpoint:
+        case Setpoint.BATTERY_POWER:
+            await _battery(station).async_write_battery_power(int(value))
+        case Setpoint.FEED_IN_LIMIT:
+            await _grid(station).async_write_feed_in_limit(int(value))
+        case Setpoint.ACTIVE_POWER_LIMIT:
+            await _grid(station).async_write_active_power_limit(value)
+        case _:
+            assert_never(setpoint)
 
-# The feed-in limit has no hand-back: the station returns to its own limit
-# 30 seconds after the last write. The active power limit is written to 100 %,
-# because a failsafe timeout of 0 would keep it forever.
-_RELEASE: dict[Setpoint, Callable[[E3dcPowerStation], Awaitable[None]]] = {
-    Setpoint.BATTERY_POWER: lambda station: _battery(
-        station
-    ).async_stop_remote_control(),
-    Setpoint.ACTIVE_POWER_LIMIT: lambda station: _grid(
-        station
-    ).async_write_active_power_limit(100),
-}
+
+async def _async_hand_back(station: E3dcPowerStation, setpoint: Setpoint) -> None:
+    match setpoint:
+        case Setpoint.BATTERY_POWER:
+            await _battery(station).async_stop_remote_control()
+        case Setpoint.FEED_IN_LIMIT:
+            # The station returns to its own limit 30 seconds after the last write
+            pass
+        case Setpoint.ACTIVE_POWER_LIMIT:
+            # Write 100 % because a failsafe timeout of 0 would keep the limit forever
+            await _grid(station).async_write_active_power_limit(100)
+        case _:
+            assert_never(setpoint)
 
 
 class SetpointHolds:
@@ -168,7 +171,7 @@ class SetpointHolds:
                 if self._closed:
                     raise HoldsClosedError("the holds are closed")
                 try:
-                    await _WRITE[setpoint](self._station, value)
+                    await _async_write(self._station, setpoint, value)
                 except InconsistentWriteError:
                     self._holds.pop(setpoint, None)
                     raise
@@ -273,7 +276,7 @@ class SetpointHolds:
         A ``ModbusError`` marks the hold failing and is raised on.
         """
         try:
-            await _WRITE[setpoint](self._station, hold.value)
+            await _async_write(self._station, setpoint, hold.value)
         except InconsistentWriteError as err:
             _LOGGER.warning(
                 "Stopped holding %s after a half-written rewrite: %s", setpoint, err
@@ -312,15 +315,12 @@ class SetpointHolds:
         """Hand ``setpoint`` back; call only while holding the lock."""
         if (hold := self._holds.get(setpoint)) is None:
             return
-        if (release := _RELEASE.get(setpoint)) is not None:
-            try:
-                await release(self._station)
-            except (ModbusError, InconsistentWriteError):
-                if hold.releasing_since is None:
-                    self._holds[setpoint] = replace(
-                        hold, releasing_since=time.monotonic()
-                    )
-                raise
+        try:
+            await _async_hand_back(self._station, setpoint)
+        except (ModbusError, InconsistentWriteError):
+            if hold.releasing_since is None:
+                self._holds[setpoint] = replace(hold, releasing_since=time.monotonic())
+            raise
         self._holds.pop(setpoint, None)
 
     def _ensure_loop(self) -> None:
