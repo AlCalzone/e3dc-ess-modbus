@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from modbus_connection import IllegalFunctionError, ModbusUnit
 from modbus_connection.encode import encode_int, encode_string
 from modbus_connection.mock import MockModbusUnit
 
@@ -18,6 +19,15 @@ def ascii_words(text: str, length: int) -> list[int]:
 def int32_words(value: int) -> list[int]:
     """An int32 as E3/DC sends it, low word first."""
     return encode_int(value, count=2, word_order="little")
+
+
+def refuse_fc16(monkeypatch: pytest.MonkeyPatch, unit: ModbusUnit) -> None:
+    """Make ``unit`` refuse FC16 writes as an illegal function."""
+
+    async def refuse(address: int, values: list[int]) -> None:
+        raise IllegalFunctionError()
+
+    monkeypatch.setattr(unit, "write_registers", refuse)
 
 
 SERIAL = "S10-12345678912"

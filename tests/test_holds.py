@@ -3,13 +3,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import FrozenInstanceError
-from unittest.mock import AsyncMock
 
 import pytest
 from modbus_connection import (
     IllegalDataAddressError,
     IllegalDataValueError,
-    IllegalFunctionError,
     ModbusTimeoutError,
 )
 from modbus_connection.mock import MockModbusUnit, WriteEvent
@@ -27,7 +25,7 @@ from e3dc_ess_modbus import (
 )
 from e3dc_ess_modbus.model import register
 
-from .conftest import seed
+from .conftest import refuse_fc16, seed
 
 BATTERY = Setpoint.BATTERY_POWER
 FEED_IN = Setpoint.FEED_IN_LIMIT
@@ -49,12 +47,6 @@ def writes(mock_modbus_unit: MockModbusUnit) -> list[WriteEvent]:
 
 def _writes_to(writes: list[WriteEvent], index: int) -> list[list[int] | list[bool]]:
     return [w.values for w in writes if w.address == register(index)]
-
-
-def _refuse_fc16(monkeypatch: pytest.MonkeyPatch, unit: MockModbusUnit) -> None:
-    monkeypatch.setattr(
-        unit, "write_registers", AsyncMock(side_effect=IllegalFunctionError())
-    )
 
 
 async def test_a_hold_is_rewritten_until_stopped(
@@ -120,7 +112,7 @@ async def test_a_half_written_start_ends_the_hold(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     await holds.async_start(BATTERY, 1000)
-    _refuse_fc16(monkeypatch, mock_modbus_unit)
+    refuse_fc16(monkeypatch, mock_modbus_unit)
     mock_modbus_unit.fail_write(register(40198), ModbusTimeoutError())
 
     with pytest.raises(InconsistentWriteError):
@@ -178,7 +170,7 @@ async def test_a_half_written_rewrite_ends_the_hold(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     await holds.async_start(BATTERY, 3000)
-    _refuse_fc16(monkeypatch, mock_modbus_unit)
+    refuse_fc16(monkeypatch, mock_modbus_unit)
     mock_modbus_unit.fail_write(register(40198), ModbusTimeoutError())
 
     await holds.async_rewrite()

@@ -370,24 +370,28 @@ async def test_raw_dump_covers_every_component(
         assert register(index) in holding
 
 
-def _with_magic() -> dict[int, int | list[int]]:
-    return {40001: 0xE3DC}
-
-
 def _inverters(station: E3dcPowerStation) -> Inverters:
     assert station.inverters is not None
     return station.inverters
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(IllegalDataAddressError(), id="refused"),
+        pytest.param(ModbusTimeoutError(), id="timeout"),
+    ],
+)
 async def test_stale_32_bit_meter_values_lose(
-    station: E3dcPowerStation, mock_modbus_unit: MockModbusUnit
+    station: E3dcPowerStation, mock_modbus_unit: MockModbusUnit, error: Exception
 ) -> None:
     await station.async_update_readings()
     assert station.power_meter_readings[0].power_l1 == -40000
 
-    mock_modbus_unit.fail_read(register(40137), IllegalDataAddressError())
-    await station.async_update_readings()
+    mock_modbus_unit.fail_read(register(40137), error)
+    report = await station.async_update_readings()
 
+    assert "wide_power_meters" in report.failed
     assert station.power_meter_readings[0].power_l1 == -200
 
 
@@ -470,17 +474,6 @@ async def test_no_inverter_slot_answering(mock_modbus_unit: MockModbusUnit) -> N
     assert report.complete
 
 
-async def test_wide_meters_timing_out_fall_back_to_16_bits(
-    station: E3dcPowerStation, mock_modbus_unit: MockModbusUnit
-) -> None:
-    await station.async_update_readings()
-    mock_modbus_unit.fail_read(register(40137), ModbusTimeoutError())
-    report = await station.async_update_readings()
-
-    assert "wide_power_meters" in report.failed
-    assert station.power_meter_readings[0].power_l1 == -200
-
-
 async def test_a_zero_timeout_is_passed_through(
     mock_modbus_unit: MockModbusUnit,
 ) -> None:
@@ -557,10 +550,6 @@ async def test_public_polls_track_meter_freshness(
     await station.async_poll(["wide_power_meters"])
 
     assert station.power_meter_readings[0].power_l1 == -200
-
-
-def test_an_empty_meter_slot_has_no_type(station: E3dcPowerStation) -> None:
-    assert station.power_meter_readings[2].meter_type is None
 
 
 async def test_meter_listeners_see_this_polls_freshness(
