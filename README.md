@@ -60,7 +60,7 @@ Every value is `None` until the first update. Each update returns an `UpdateRepo
 - **Two-register writes:** the feed-in limit and the battery power go out as one FC16 write. If the device refuses FC16 as an illegal function, the library logs it once and sends two single-register writes from then on. Between those two writes, the register pair holds a value that is neither the old nor the new one. If the pair may be left that way, by an error or a cancellation, the library ends remote battery control, or writes the last feed-in limit back, before it raises. Writes to the battery and the feed-in limit wait for each other, so they reach the device in the order they were made.
 - **Feed-in limit:** `feed_in_limit` reads back the last value written. The limit in effect may differ.
 - **Wallbox bits:** which bits a wallbox uses depends on its model. Unused bits stay unset.
-- **Testing:** built against the vendor's Modbus TCP manual, version 2.80, and tested against modbus-connection's mock. It has not been tested on real hardware.
+- **Testing:** built against the vendor's Modbus TCP manual, version 2.80, and tested against modbus-connection's mock and an E3/DC one with firmware H20_2026_44.
 
 ## API
 
