@@ -99,10 +99,9 @@ class E3dcPowerStation(Device):
         self.inverters: Inverters | None = None
 
         self._setup_lock = asyncio.Lock()
-        self._fresh_meter_blocks: set[str] = set()
+        self._wide_meters_fresh = False
         self._control_state = ControlState()
         self._stop_watching_connection = unit.on_connection_lost(self._forget_setpoints)
-        self._note_fresh_on_update(self.power_meters, "power_meters")
 
     @classmethod
     async def async_detect(
@@ -113,7 +112,6 @@ class E3dcPowerStation(Device):
         Raises ``NotAnE3dcError`` when the device is not in E3DC mode.
         """
         device = cls(unit, timeout=timeout)
-        await device._async_read_identity()
         await device.async_ensure_setup()
         return device
 
@@ -149,11 +147,10 @@ class E3dcPowerStation(Device):
         that read them. The 16-bit values and the meter types are from the
         last poll the 16-bit block answered.
         """
-        wide_fresh = "wide_power_meters" in self._fresh_meter_blocks
         readings: dict[int, PowerMeterReading] = {}
         for number, narrow in enumerate(self.power_meters.meters):
             powers = (narrow.power_l1, narrow.power_l2, narrow.power_l3)
-            if self.wide_power_meters is not None and wide_fresh:
+            if self.wide_power_meters is not None and self._wide_meters_fresh:
                 wide = self.wide_power_meters.meters[number]
                 wide_powers = (wide.power_l1, wide.power_l2, wide.power_l3)
                 if None not in wide_powers:
@@ -176,8 +173,8 @@ class E3dcPowerStation(Device):
         unit = self.modbus_unit
         self.wide_power_meters = await self._async_probe(WidePowerMeters(unit))
         if self.wide_power_meters is not None:
-            self._fresh_meter_blocks.add("wide_power_meters")
-            self._note_fresh_on_update(self.wide_power_meters, "wide_power_meters")
+            self._wide_meters_fresh = True
+            self.wide_power_meters.add_update_listener(self._note_wide_meters_fresh)
         self.grid_status = await self._async_probe(GridStatus(unit))
         # The control components share one state, which must be in place
         # before the probe reads the feed-in limit into it
@@ -272,16 +269,17 @@ class E3dcPowerStation(Device):
         if self.grid_control is not None:
             self.grid_control.clear_setpoints()
 
-    def _note_fresh_on_update(self, component: Component, name: str) -> None:
-        """Mark a meter block fresh before any other listener of it runs."""
-        component.add_update_listener(lambda: self._fresh_meter_blocks.add(name))
+    def _note_wide_meters_fresh(self) -> None:
+        """Mark the 32-bit meter values fresh, before any other listener runs."""
+        self._wide_meters_fresh = True
 
     async def async_poll(
         self, names: Iterable[str], report: UpdateReport | None = None
     ) -> UpdateReport:
-        """Poll ``names``, forgetting first which meter blocks were fresh."""
+        """Poll ``names``, forgetting first whether the 32-bit meters were fresh."""
         names = tuple(names)
-        self._fresh_meter_blocks -= {"power_meters", "wide_power_meters"} & set(names)
+        if "wide_power_meters" in names:
+            self._wide_meters_fresh = False
         return await super().async_poll(names, report)
 
     async def async_update_readings(self) -> UpdateReport:
