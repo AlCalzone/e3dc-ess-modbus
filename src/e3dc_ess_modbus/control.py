@@ -457,10 +457,7 @@ class BatteryControl(E3dcComponent):
 
     async def async_write_remote_control_disabled(self, disabled: bool) -> None:
         """Write register 40199. True does what ``async_stop_remote_control`` does."""
-        if _flag(disabled):
-            await self.async_stop_remote_control()
-        else:
-            await self.write("remote_control_disabled", False)
+        await self.write("remote_control_disabled", disabled)
 
 
 class InverterModeControl(E3dcComponent):
