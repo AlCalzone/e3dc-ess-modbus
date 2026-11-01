@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
 from typing import TYPE_CHECKING
 
 from modbus_connection.model import (
-    ComponentGroup,
     bits,
     enum,
     flags,
@@ -16,7 +14,7 @@ from modbus_connection.model import (
 )
 
 from .enums import EmergencyPowerStatus, EmsStatus
-from .model import E3dcComponent, register
+from .model import E3dcComponent, NumberedComponents, register
 
 if TYPE_CHECKING:
     from modbus_connection import ModbusUnit
@@ -61,29 +59,15 @@ class DcString(E3dcComponent):
     power = integer(register(40102), signed=False, stride=1, unit="W")
 
 
-class DcStrings(ComponentGroup, Mapping[int, DcString]):
+class DcStrings(NumberedComponents[DcString]):
     """The DC strings 1 to 3, read as one because their registers interleave."""
-
-    # Compare and hash by identity, the way a component does
-    __eq__ = object.__eq__
-    __hash__ = object.__hash__
 
     def __init__(self, unit: ModbusUnit) -> None:
         """Set up the strings."""
-        self._strings = {
-            number: DcString(unit, index=number)
-            for number in range(1, DC_STRING_COUNT + 1)
-        }
-        super().__init__(unit, self._strings.values())
-
-    def __getitem__(self, number: int) -> DcString:
-        """DC string ``number``, from 1 to 3."""
-        return self._strings[number]
-
-    def __iter__(self) -> Iterator[int]:
-        """The string numbers, 1 first."""
-        return iter(self._strings)
-
-    def __len__(self) -> int:
-        """How many DC strings there are."""
-        return len(self._strings)
+        super().__init__(
+            unit,
+            {
+                number: DcString(unit, index=number)
+                for number in range(1, DC_STRING_COUNT + 1)
+            },
+        )

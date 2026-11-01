@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
-from modbus_connection.model import Component, UpdateReport
+from collections.abc import Iterator, Mapping
+from typing import TYPE_CHECKING
 
-__all__ = ["E3dcComponent", "UpdateReport", "register"]
+from modbus_connection.model import Component, ComponentGroup, UpdateReport
+
+if TYPE_CHECKING:
+    from modbus_connection import ModbusUnit
+
+__all__ = ["E3dcComponent", "NumberedComponents", "UpdateReport", "register"]
 
 
 def register(index: int) -> int:
@@ -17,3 +23,28 @@ def register(index: int) -> int:
 
 class E3dcComponent(Component):
     """A sub-system of the E3/DC Simple Mode register map."""
+
+
+class NumberedComponents[C: Component](ComponentGroup, Mapping[int, C]):
+    """Components read as one group, keyed by the manual's numbering."""
+
+    # Compare and hash by identity, the way a component does
+    __eq__ = object.__eq__
+    __hash__ = object.__hash__
+
+    def __init__(self, unit: ModbusUnit, members: dict[int, C]) -> None:
+        """Set up the group over ``members``."""
+        self._members = members
+        super().__init__(unit, members.values())
+
+    def __getitem__(self, number: int) -> C:
+        """The component numbered ``number``."""
+        return self._members[number]
+
+    def __iter__(self) -> Iterator[int]:
+        """The numbers, in order."""
+        return iter(self._members)
+
+    def __len__(self) -> int:
+        """How many components the group has."""
+        return len(self._members)
