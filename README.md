@@ -68,7 +68,7 @@ Every value is `None` until the first update. Each update returns an `UpdateRepo
 
 An E3/DC home power station. `timeout` asks the connection for a per-request timeout, in seconds.
 
-- `await async_detect(unit, *, timeout=None)`: build the device, read its identity and find out which optional components the firmware serves.
+- `await async_detect(unit, *, timeout=None)`: build the device, read its identity and find out which optional components the firmware serves. If that fails, it closes the device before raising.
 - `await async_update()`: refresh every component.
 - `await async_update_readings()`: refresh what the device measures and reports on its own: power, DC strings, wallboxes, meters, power output and inverter mode status, battery limits and inverters.
 - `await async_update_settings()`: refresh the values that change only when written: the feed-in limit, the failsafe timeouts and the battery remote control flag.

@@ -109,10 +109,15 @@ class E3dcPowerStation(Device):
     ) -> Self:
         """Build the device, read its identity and settle which blocks it serves.
 
-        Raises ``NotAnE3dcError`` when the device is not in E3DC mode.
+        Raises ``NotAnE3dcError`` when the device is not in E3DC mode. A device
+        whose setup fails is closed before the error is raised.
         """
         device = cls(unit, timeout=timeout)
-        await device.async_ensure_setup()
+        try:
+            await device.async_ensure_setup()
+        except BaseException:
+            device.close()
+            raise
         return device
 
     def close(self) -> None:

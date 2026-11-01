@@ -48,6 +48,35 @@ async def test_detect_rejects_a_device_without_the_magic(
         await E3dcPowerStation.async_detect(mock_modbus_unit)
 
 
+@pytest.mark.parametrize(
+    ("error", "raised"),
+    [
+        pytest.param(IllegalDataAddressError(), NotAnE3dcError, id="not_e3dc"),
+        pytest.param(ModbusConnectionError(), ModbusConnectionError, id="link_down"),
+    ],
+)
+async def test_detect_closes_a_device_whose_setup_fails(
+    mock_modbus_unit: MockModbusUnit,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    raised: type[Exception],
+) -> None:
+    closed: list[E3dcPowerStation] = []
+    close = E3dcPowerStation.close
+
+    def record_close(station: E3dcPowerStation) -> None:
+        closed.append(station)
+        close(station)
+
+    monkeypatch.setattr(E3dcPowerStation, "close", record_close)
+    mock_modbus_unit.fail_read(register(40001), error)
+
+    with pytest.raises(raised):
+        await E3dcPowerStation.async_detect(mock_modbus_unit)
+
+    assert len(closed) == 1
+
+
 async def test_setup_rejects_a_device_without_the_magic(
     mock_modbus_unit: MockModbusUnit,
 ) -> None:
