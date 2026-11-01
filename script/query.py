@@ -65,6 +65,11 @@ def print_station(station: E3dcPowerStation) -> None:
             print_component(component, title=name)
 
 
+def _describe(err: Exception) -> str:
+    # A timeout arrives with no message of its own
+    return str(err) or type(err).__name__
+
+
 async def main() -> int:
     """Read one power station and print it."""
     # The backend logs a failed connect at ERROR with its traceback; the
@@ -86,15 +91,13 @@ async def main() -> int:
     try:
         connection = await connect_from_args(args)
     except ModbusError as err:
-        # A connect timeout arrives with no message of its own.
-        detail = str(err) or type(err).__name__
-        print(f"Could not connect to {args.target}: {detail}")
+        print(f"Could not connect to {args.target}: {_describe(err)}")
         return 1
 
     counting = CountingUnit(connection.for_unit(args.unit))
     try:
         station = await E3dcPowerStation.async_detect(counting)
-        report = await station.async_update()  # the first update sets it up
+        report = await station.async_update()
         # A raw dump re-reads everything, so count the poll alone.
         poll_reads = counting.reads
         raw = await station.async_read_raw() if args.raw else None
@@ -102,7 +105,7 @@ async def main() -> int:
         print(f"Not an E3/DC device: {err}")
         return 1
     except ModbusError as err:
-        print(f"Could not read the power station: {str(err) or type(err).__name__}")
+        print(f"Could not read the power station: {_describe(err)}")
         return 1
     finally:
         await connection.close()
@@ -111,7 +114,7 @@ async def main() -> int:
     if report.failed:
         print("\nFailed to read:")
         for name, error in report.failed.items():
-            print(f"  {name}: {str(error) or type(error).__name__}")
+            print(f"  {name}: {_describe(error)}")
     if raw is not None:
         print("\nRaw registers")
         # The dump arrives address-ordered; sorting keys would undo that.
