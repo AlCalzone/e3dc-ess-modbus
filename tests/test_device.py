@@ -22,6 +22,7 @@ from e3dc_ess_modbus import (
     Inverters,
     NotAnE3dcError,
     PowerMeterType,
+    SgReadyStatus,
 )
 from e3dc_ess_modbus.model import register
 
@@ -166,7 +167,19 @@ async def test_power_meters_prefer_the_32_bit_powers(
     assert not station.power_meter_readings[1].is_installed
     assert station.power_meter_readings[2].meter_type is None
     assert station.wide_power_meters is not None
-    assert station.wide_power_meters.sg_ready_status == 1
+    assert station.wide_power_meters.sg_ready_status is SgReadyStatus.BLOCKED
+
+
+async def test_an_unknown_sg_ready_value_is_none(
+    mock_modbus_unit: MockModbusUnit,
+) -> None:
+    seed(mock_modbus_unit)
+    mock_modbus_unit.holding[register(40137)] = 0
+    station = E3dcPowerStation(mock_modbus_unit)
+    await station.async_update_readings()
+
+    assert station.wide_power_meters is not None
+    assert station.wide_power_meters.sg_ready_status is None
 
 
 async def test_power_meters_fall_back_to_16_bits(

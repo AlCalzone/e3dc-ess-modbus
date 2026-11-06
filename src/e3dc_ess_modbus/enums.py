@@ -53,6 +53,17 @@ class PowerMeterType(IntEnum):
     """Measured power that is neither charged into nor drawn from the battery."""
 
 
+class SgReadyStatus(IntEnum):
+    """Register 40137: the SG Ready operating state."""
+
+    BLOCKED = 1
+    """The grid operator blocks the heat pump."""
+    NORMAL = 2
+    SWITCH_ON_RECOMMENDED = 3
+    """Surplus power is available, so running the heat pump is recommended."""
+    FORCED_ON = 4
+
+
 class InverterModeRequest(IntEnum):
     """Register 40200: the inverter operating mode to force."""
 

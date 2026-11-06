@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from modbus_connection.model import enum, int32, integer, repeating_group
 
-from .enums import PowerMeterType
+from .enums import PowerMeterType, SgReadyStatus
 from .model import E3dcComponent, register
 
 POWER_METER_COUNT = 8
@@ -40,6 +40,9 @@ class WidePowerMeters(E3dcComponent):
     Firmware without these registers refuses the block.
     """
 
-    sg_ready_status = integer(register(40137), signed=False)
-    """The manual documents no values for this register."""
+    sg_ready_status = enum(register(40137), SgReadyStatus)
+    """The manual documents no values, so these follow the SG Ready standard.
+
+    ``None`` for any other value.
+    """
     meters = repeating_group(POWER_METER_COUNT, PowerMeterPhases, stride=6)

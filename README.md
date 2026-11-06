@@ -147,7 +147,7 @@ A `PowerMeterReading` has:
 
 Optional. Present when the firmware serves the 32-bit meter values.
 
-- `sg_ready_status`: the SG Ready status code. The manual documents no values.
+- `sg_ready_status`: a `SgReadyStatus`, the SG Ready operating state, or `None` for a value the SG Ready standard doesn't define.
 
 ### `grid_status` (`GridStatus`)
 

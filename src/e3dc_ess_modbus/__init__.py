@@ -14,6 +14,7 @@ from .enums import (
     InverterMode,
     InverterModeRequest,
     PowerMeterType,
+    SgReadyStatus,
 )
 from .errors import (
     E3dcError,
@@ -59,6 +60,7 @@ __all__ = [
     "PowerMeterPhases",
     "PowerMeterReading",
     "PowerMeterType",
+    "SgReadyStatus",
     "PowerMeters",
     "Setpoint",
     "SetpointHolds",
