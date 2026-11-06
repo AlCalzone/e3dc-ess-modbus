@@ -59,9 +59,11 @@ class SgReadyStatus(IntEnum):
     BLOCKED = 1
     """The grid operator blocks the heat pump."""
     NORMAL = 2
+    """The heat pump runs as it would without SG Ready."""
     SWITCH_ON_RECOMMENDED = 3
     """Surplus power is available, so running the heat pump is recommended."""
     FORCED_ON = 4
+    """The heat pump is ordered to switch on."""
 
 
 class InverterModeRequest(IntEnum):
