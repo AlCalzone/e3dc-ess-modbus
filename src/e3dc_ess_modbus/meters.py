@@ -41,8 +41,5 @@ class WidePowerMeters(E3dcComponent):
     """
 
     sg_ready_status = enum(register(40137), SgReadyStatus)
-    """The manual documents no values, so these follow the SG Ready standard.
-
-    ``None`` for any other value.
-    """
+    """``None`` for a value the SG Ready standard doesn't define."""
     meters = repeating_group(POWER_METER_COUNT, PowerMeterPhases, stride=6)
